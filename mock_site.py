@@ -1,0 +1,442 @@
+"""Mock Boss 直聘测试站 —— 复现关键「结构」，供求职系统全量功能联调。
+
+复现的 Boss 直聘关键环节（URL / DOM 选择器 / 接口返回格式对齐，便于逐环节调试）：
+- 登录页      /web/user/                        （含二维码 img.qrcode-img）
+- 搜索页      /web/geek/job?query=&city=&page=   （li.job-card-wrapper 列表，页面 JS 发接口）
+- 搜索接口    /wapi/zpgeek/search/joblist.json  （返回 {"zpData":{"jobList":[...]}}）
+- 岗位详情页  /job_detail/<id>.html             （a.btn-startchat 立即沟通按钮）
+- 聊天面板    .chat-input textarea             （发招呼语）
+- 发招呼语接口 /wapi/zpgeek/friend/add.json     （POST，记录投递）
+- 投递记录    /api/greets                      （GET，供测试断言）
+
+注意：只复现结构，不复现 Boss 的反爬/风控/限流性能（那些是服务器私有、动态变化的）。
+零依赖（仅 Python 标准库），`python mock_site.py` 启动于 127.0.0.1:5001。
+"""
+import json
+import re
+import time
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+from urllib.parse import urlparse, parse_qs
+import config
+
+BASE_DIR = Path(__file__).resolve().parent
+PORT = 5001
+GREETS_FILE = config.DATA_DIR / "mock_greets.jsonl"
+
+
+# ---------- 内置岗位数据（字段名对齐真实 Boss 的 api_field_map） ----------
+def _build_jobs():
+    jobs = []
+    specs = [
+        ("Python后端开发工程师", ["Python", "Flask", "Django", "MySQL", "Redis"], "互联网"),
+        ("Java后端开发工程师", ["Java", "Spring", "MySQL", "Redis", "微服务"], "互联网"),
+        ("Go后端开发工程师", ["Go", "gRPC", "Kubernetes", "Redis"], "互联网"),
+        ("前端开发工程师", ["JavaScript", "Vue", "React", "TypeScript"], "互联网"),
+        ("算法工程师", ["Python", "PyTorch", "机器学习", "深度学习", "NLP"], "人工智能"),
+        ("大数据开发工程师", ["Hadoop", "Spark", "Flink", "SQL"], "大数据"),
+        ("测试开发工程师", ["Python", "pytest", "Selenium", "自动化测试"], "软件"),
+        ("运维开发工程师", ["Linux", "Docker", "Kubernetes", "DevOps", "CI/CD"], "软件"),
+    ]
+    cities = ["北京", "上海", "深圳", "杭州", "成都", "武汉"]
+    companies = ["示例科技", "云创网络", "星辰软件", "未来智能", "极光数据", "启明互联"]
+    idx = 0
+    for ci, city in enumerate(cities):
+        for si, (name, skills, industry) in enumerate(specs):
+            idx += 1
+            jobs.append({
+                "jobId": idx,
+                "encryptJobId": "http://127.0.0.1:%d/job_detail/%d.html" % (PORT, idx),
+                "jobName": name,
+                "brandName": companies[(ci + si) % len(companies)],
+                "cityName": city,
+                "brandIndustry": industry,
+                "salaryDesc": "%d-%dK·14薪" % (15 + (idx % 8) * 2, 25 + (idx % 8) * 3),
+                "jobDegree": "本科",
+                "jobExperience": ["应届生", "1-3年", "3-5年"][idx % 3],
+                "skills": skills,
+                "jobLabels": [skills[0], industry, "全职"],
+                "contact": False,
+                "entryType": "API",
+                "entryAddr": "http://127.0.0.1:%d/wapi/zpgeek/friend/add.json" % PORT,
+            })
+    return jobs
+
+
+JOBS = _build_jobs()
+
+
+def _fake_qr_datauri():
+    """生成一张「看起来像二维码」的 SVG（25x25 模块，三个定位角），仅供演示站登录页使用。"""
+    import base64
+    import random
+    n, rnd = 25, random.Random(20261113)
+    finder_reserved, cells = set(), set()
+
+    def finder(ox, oy):
+        for dx in range(-1, 8):           # 定位角外圈留白
+            for dy in range(-1, 8):
+                finder_reserved.add((ox + dx, oy + dy))
+        for dx in range(7):
+            for dy in range(7):
+                if dx in (0, 6) or dy in (0, 6) or (2 <= dx <= 4 and 2 <= dy <= 4):
+                    cells.add((ox + dx, oy + dy))
+
+    for ox, oy in ((0, 0), (n - 7, 0), (0, n - 7)):
+        finder(ox, oy)
+    for x in range(n):
+        for y in range(n):
+            if (x, y) not in finder_reserved and rnd.random() < 0.42:
+                cells.add((x, y))
+    rects = "".join('<rect x="%d" y="%d" width="1" height="1"/>' % c for c in sorted(cells))
+    svg = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 %d %d">'
+           '<rect width="%d" height="%d" fill="#fff"/><g fill="#111">%s</g></svg>') % (n, n, n, n, rects)
+    return "data:image/svg+xml;base64," + base64.b64encode(svg.encode()).decode()
+
+
+# ---------- 页面样式（只美化，不改任何 DOM 类名/选择器，测试依赖保持不变） ----------
+_STYLE = """
+<style>
+* { box-sizing: border-box; }
+body { margin: 0; padding: 24px; background: #F5F6FA; color: #1F2329;
+  font-family: "PingFang SC", "Microsoft YaHei", system-ui, sans-serif; }
+h1 { font-size: 22px; } .job-name { font-size: 17px; font-weight: 700; color: #1F2329;
+  text-decoration: none; }
+.search-box input { width: 420px; padding: 10px 14px; border: 1px solid #E2E8F0;
+  border-radius: 8px; font-size: 14px; outline: none; }
+.search-box input:focus { border-color: #00BEBD; box-shadow: 0 0 0 3px rgba(0,190,189,.15); }
+.job-list { list-style: none; padding: 0; margin: 16px 0; max-width: 760px; }
+.job-card-wrapper { margin-bottom: 12px; }
+.job-card-body { background: #fff; border: 1px solid #ECEEF3; border-radius: 12px;
+  padding: 16px 18px; transition: box-shadow .15s ease, transform .1s ease; }
+.job-card-body:hover { box-shadow: 0 8px 24px -10px rgba(15,23,42,.25);
+  transform: translateY(-1px); }
+.company-name { color: #5E6470; font-size: 13px; margin-top: 6px; }
+.job-area { color: #8A8F99; font-size: 12px; margin-top: 4px; }
+.salary { color: #FF6A3D; font-weight: 700; font-size: 14px; margin-top: 6px; }
+.btn { display: inline-block; background: #00BEBD; color: #fff; border: none;
+  padding: 10px 28px; border-radius: 8px; font-size: 14px; cursor: pointer;
+  text-decoration: none; margin-top: 14px; }
+.btn:hover { background: #00A8A7; }
+.qrcode-img { width: 180px; height: 180px; border: 1px solid #E2E8F0; border-radius: 8px;
+  background: repeating-linear-gradient(45deg,#eee 0 6px,#fff 6px 12px); }
+.chat-input textarea { width: 520px; height: 90px; border: 1px solid #E2E8F0;
+  border-radius: 8px; padding: 10px; font-size: 14px; font-family: inherit; }
+#chat-panel { margin-top: 14px; background: #fff; border: 1px solid #ECEEF3;
+  border-radius: 12px; padding: 16px; max-width: 580px; }
+.chat-conversation { min-height: 60px; color: #8A8F99; font-size: 13px; margin-bottom: 10px; }
+</style>
+"""
+
+
+def _read_greets():
+    recs = []
+    if GREETS_FILE.exists():
+        for line in GREETS_FILE.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                try:
+                    recs.append(json.loads(line))
+                except Exception:
+                    pass
+    return recs
+
+
+def _append_greet(data):
+    rec = {"time": time.strftime("%Y-%m-%d %H:%M:%S"), "payload": data}
+    GREETS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(GREETS_FILE, "a", encoding="utf-8") as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    return rec
+
+
+# ---------- HR 回复模拟（供方案 B 的「检查新回复」联调） ----------
+REPLIES_FILE = config.DATA_DIR / "mock_replies.jsonl"
+
+
+def _read_replies():
+    recs = []
+    if REPLIES_FILE.exists():
+        for line in REPLIES_FILE.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                try:
+                    recs.append(json.loads(line))
+                except Exception:
+                    pass
+    return recs
+
+
+def _append_reply(data):
+    rec = {"time": time.strftime("%Y-%m-%d %H:%M:%S"),
+           "单位名称": str(data.get("单位名称", "") or ""),
+           "岗位名称": str(data.get("岗位名称", "") or ""),
+           "text": str(data.get("text", "") or ""),
+           "bossName": str(data.get("bossName", "HR") or "HR")}
+    REPLIES_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(REPLIES_FILE, "a", encoding="utf-8") as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    return rec
+
+
+def _chat_sessions():
+    """由「已投递记录 + HR 回复」合成会话列表（对齐 Boss zpchat 的字段命名）。"""
+    sessions = {}
+    for greet in _read_greets():
+        p = greet.get("payload") or {}
+        key = (p.get("单位名称", ""), p.get("岗位名称", ""))
+        sessions[key] = {
+            "brandName": p.get("单位名称", ""),
+            "jobName": p.get("岗位名称", ""),
+            "bossName": "HR",
+            "lastMessage": "你已发送招呼语",
+            "lastTime": greet.get("time", ""),
+            "unread": 0,
+        }
+    for reply in _read_replies():
+        key = (reply.get("单位名称", ""), reply.get("岗位名称", ""))
+        item = sessions.get(key)
+        if item is None:
+            item = sessions.setdefault(key, {
+                "brandName": reply.get("单位名称", ""),
+                "jobName": reply.get("岗位名称", ""),
+                "bossName": reply.get("bossName", "HR"),
+            })
+        item.update(lastMessage=reply.get("text", ""), lastTime=reply.get("time", ""),
+                    unread=1, bossName=reply.get("bossName", item.get("bossName", "HR")))
+    return list(sessions.values())
+
+
+def _chat_page():
+    items = []
+    for s in _chat_sessions():
+        items.append(
+            "<li class='chat-item'><div class='chat-name'>%s</div>"
+            "<div class='chat-job'>%s</div><div class='chat-msg'>%s</div>"
+            "<div class='chat-time'>%s</div></li>"
+            % (s.get("brandName", ""), s.get("jobName", ""),
+               s.get("lastMessage", ""), s.get("lastTime", "")))
+    return (
+        "<!doctype html><html><head><meta charset='utf-8'><title>消息 - Mock Boss</title>"
+        + _STYLE +
+        "<style>li.chat-item{list-style:none;background:#fff;border:1px solid #ECEEF3;"
+        "border-radius:10px;padding:12px;margin:8px 0;max-width:640px}"
+        ".chat-name{font-weight:600}.chat-job{color:#0AA6A6;font-size:13px}"
+        ".chat-msg{color:#5B6270;font-size:13px;margin-top:4px}"
+        ".chat-time{color:#9AA0AB;font-size:12px}</style></head><body>"
+        "<h1>消息</h1><ul class='chat-list'>%s</ul></body></html>" % ("".join(items) or "<li>暂无会话</li>"))
+
+
+class MockHandler(BaseHTTPRequestHandler):
+    def log_message(self, *args):  # 静默请求日志
+        pass
+
+    def _json(self, obj, code=200):
+        body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _html(self, html, code=200):
+        body = html.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        u = urlparse(self.path)
+        path = u.path
+        q = parse_qs(u.query)
+        if path == "/wapi/zpgeek/search/joblist.json":
+            return self._api_search(q)
+        if path == "/web/geek/job":
+            return self._search_page(q)
+        if path == "/web/user/":
+            return self._login_page()
+        m = re.match(r"^/job_detail/(\d+)\.html$", path)
+        if m:
+            return self._job_detail(int(m.group(1)))
+        if path == "/api/greets":
+            return self._json({"code": 0, "data": _read_greets()})
+        if path == "/api/replies":
+            return self._json({"code": 0, "data": _read_replies()})
+        if path == "/web/geek/chat":
+            return self._html(_chat_page())
+        if path == "/wapi/zpchat/geek/getUserJobList":
+            return self._json({"code": 0, "message": "Success",
+                               "zpData": {"sessions": _chat_sessions()}})
+        if path == "/":
+            return self._html(
+                "<!doctype html><html><head><meta charset='utf-8'>"
+                "<title>Mock Boss 测试站</title>" + _STYLE + "</head><body>"
+                "<h1>Mock Boss 测试站</h1>"
+                "<div class='job-card-body' style='max-width:640px'>"
+                "<p>接口：/wapi/zpgeek/search/joblist.json · /job_detail/&lt;id&gt;.html · "
+                "/wapi/zpgeek/friend/add.json · /api/greets</p>"
+                "<a class='btn' href='/web/user/'>去登录页</a> "
+                "<a class='btn' href='/web/geek/job?query=后端&city=北京&page=1'>去搜索页</a>"
+                "</div></body></html>")
+        return self._json({"code": 1, "msg": "not found"}, 404)
+
+    def do_POST(self):
+        u = urlparse(self.path)
+        length = int(self.headers.get("Content-Length", 0) or 0)
+        body = self.rfile.read(length).decode("utf-8", "ignore")
+        try:
+            data = json.loads(body) if body else {}
+        except Exception:
+            data = {"raw": body}
+        if u.path == "/wapi/zpgeek/friend/add.json":
+            rec = _append_greet(data)
+            return self._json({"code": 0, "message": "已发送", "data": rec})
+        if u.path == "/api/hr_reply":
+            rec = _append_reply(data)
+            return self._json({"code": 0, "data": rec})
+        return self._json({"code": 1, "msg": "not found"}, 404)
+
+    # ---- 搜索接口（对齐真实 Boss 返回结构 zpData.jobList） ----
+    def _api_search(self, q):
+        keyword = (q.get("query", [""])[0] or q.get("keyword", [""])[0] or "").strip()
+        city = (q.get("city", [""])[0] or "").strip()
+        page = int(q.get("page", ["1"])[0] or 1)
+        size = int(q.get("pageSize", ["30"])[0] or 30)
+        jobs = list(JOBS)
+        if keyword:
+            # 真实检索把空格分隔的多词当「任一命中」（相关度排序）；这里同样按词拆开，
+            # 否则默认关键词「Python 后端」这类带空格的查询在 Mock 站会返回 0 条，流程走不下去。
+            tokens = [t for t in re.split(r"[\s,，]+", keyword.lower()) if t]
+            def _hit(j):
+                haystack = " ".join([j["jobName"], j.get("brandIndustry", ""),
+                                     " ".join(j.get("skills", []))] + list(j.get("jobLabels", []))).lower()
+                return any(t in haystack for t in tokens)
+            jobs = [j for j in jobs if _hit(j)]
+        # Boss 用城市码（101010100 之类）则忽略过滤；城市名则精确匹配
+        if city and not city.isdigit():
+            jobs = [j for j in jobs if city in j["cityName"]]
+        start = (page - 1) * size
+        return self._json({"code": 0, "message": "Success",
+                           "zpData": {"jobList": jobs[start:start + size]}})
+
+    # ---- 搜索页（页面 JS 发接口，供 DrissionPage 旁听测试） ----
+    def _search_page(self, q):
+        keyword = q.get("query", [""])[0] or ""
+        city = q.get("city", [""])[0] or ""
+        page = q.get("page", ["1"])[0] or "1"
+        html = (
+            "<!doctype html><html><head><meta charset='utf-8'>"
+            "<title>招聘 - Mock Boss</title>" + _STYLE + "</head><body>"
+            "<h1>Mock Boss 直聘 · 搜索</h1>"
+            "<div class='search-box'><input id='kw' value='%s'></div>"
+            "<ul class='job-list'></ul>"
+            "<script>"
+            "(async function(){"
+            "  var kw=document.getElementById('kw').value;"
+            "  var url='/wapi/zpgeek/search/joblist.json?query='+encodeURIComponent(kw)"
+            "        +'&city='+encodeURIComponent('%s')+'&page=%s&pageSize=30';"
+            "  var resp=await fetch(url); var data=await resp.json();"
+            "  var list=(data.zpData&&data.zpData.jobList)||[];"
+            "  var ul=document.querySelector('.job-list');"
+            "  list.forEach(function(j){"
+            "    var li=document.createElement('li'); li.className='job-card-wrapper';"
+            "    li.innerHTML='<div class=\"job-card-body\">'"
+            "      +'<a class=\"job-name\" href=\"/job_detail/'+j.jobId+'.html\">'+j.jobName+'</a>'"
+            "      +'<div class=\"company-name\">'+j.brandName+'</div>'"
+            "      +'<div class=\"job-area\">'+j.cityName+'</div>'"
+            "      +'<div class=\"salary\">'+j.salaryDesc+'</div></div>';"
+            "    ul.appendChild(li);"
+            "  });"
+            "})();"
+            "</script></body></html>"
+        ) % (keyword, city, page)
+        return self._html(html)
+
+    # ---- 登录页（含二维码，点击「模拟登录」跳到搜索页） ----
+    def _login_page(self):
+        html = (
+            "<!doctype html><html><head><meta charset='utf-8'>"
+            "<title>登录 - Mock Boss</title>" + _STYLE + "</head><body>"
+            "<h1>Mock Boss 登录</h1>"
+            "<img class='qrcode-img' width='200' height='200' src='" + _fake_qr_datauri() + "'>"
+            "<p>扫码登录（测试站：点按钮即登录）</p>"
+            "<button onclick=\"document.cookie='mock_login=1; path=/'; location.href='/web/geek/job?query=后端&city=北京&page=1'\">模拟登录成功</button>"
+            "</body></html>")
+        return self._html(html)
+
+    # ---- 岗位详情页（立即沟通按钮 + 聊天输入框） ----
+    def _job_detail(self, job_id):
+        job = next((j for j in JOBS if j["jobId"] == job_id), None)
+        if not job:
+            return self._html("<meta charset='utf-8'><h1>岗位不存在</h1>", 404)
+        html = (
+            "<!doctype html><html><head><meta charset='utf-8'>"
+            "<title>%s</title>" % job["jobName"] + _STYLE + "</head><body>"
+            "<div class='job-card-body' style='max-width:640px'>"
+            "<span class='job-name'>%s</span>"
+            "<div class='company-name'>%s</div>"
+            "<div class='job-area'>%s</div>"
+            "<div class='salary'>%s</div>"
+            "<a class='btn btn-startchat' href='javascript:void(0)' onclick='openChat()'>立即沟通</a>"
+            "</div>"
+            "<div id='chat-panel' style='display:none'>"
+            "<div class='chat-conversation'></div>"
+            "<div class='chat-input'><textarea placeholder='输入招呼语'></textarea></div>"
+            "</div>"
+            "<script>"
+            "function openChat(){document.getElementById('chat-panel').style.display='block';}"
+            "function sendGreet(){"
+            "  var ta=document.querySelector('.chat-input textarea');"
+            "  var text=(ta.value||'').trim();"
+            "  if(!text){return;}"
+            "  var box=document.querySelector('.chat-conversation');"
+            "  var d=document.createElement('div');"
+            "  d.className='chat-message'; d.textContent=text; box.appendChild(d);"
+            "  ta.value='';"
+            "  fetch('/wapi/zpgeek/friend/add.json',{method:'POST',"
+            "    headers:{'Content-Type':'application/json'},"
+            "    body:JSON.stringify({jobId:%d, greeting:text})});"
+            "}"
+            "document.querySelector('.chat-input textarea').addEventListener('keydown',function(e){"
+            "  if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendGreet();}});"
+            "</script></body></html>"
+        ) % (job["jobName"], job["brandName"], job["cityName"],
+             job["salaryDesc"], job_id)
+        return self._html(html)
+
+
+_server = None
+
+
+def start_server(port=PORT):
+    """启动 mock 站（阻塞，供 `python mock_site.py` 直接运行）。"""
+    global _server
+    _server = HTTPServer(("127.0.0.1", port), MockHandler)
+    print("Mock Boss 测试站已启动：http://127.0.0.1:%d" % port)
+    print("  - 搜索接口：/wapi/zpgeek/search/joblist.json?query=后端&city=北京&page=1")
+    print("  - 投递记录：/api/greets")
+    _server.serve_forever()
+
+
+def start_in_background(port=PORT):
+    """以守护线程启动 mock 站，返回 server 句柄（供测试脚本内嵌使用）。"""
+    global _server, PORT, JOBS
+    _server = HTTPServer(("127.0.0.1", port), MockHandler)
+    PORT = _server.server_address[1]
+    JOBS = _build_jobs()
+    t = threading.Thread(target=_server.serve_forever, daemon=True)
+    t.start()
+    return _server
+
+
+def stop_server():
+    global _server
+    if _server:
+        _server.shutdown()
+        _server.server_close()
+        _server = None
+
+
+if __name__ == "__main__":
+    start_server()

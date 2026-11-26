@@ -1,0 +1,2 @@
+# 兼容入口：等价于 pip install ".[browser]"，真实声明见 pyproject.toml
+.[browser]

@@ -1,0 +1,9 @@
+# 固定浅色主题基线：应用整体按浅底设计，跟随系统深色时会出现"黑底灰字"。
+# 需要暗色时：`python start.py --theme.base dark` 或改这里（theme.py 已内置暗色令牌）。
+[theme]
+base = "light"
+primaryColor = "#4F46E5"
+backgroundColor = "#F7F8FC"
+secondaryBackgroundColor = "#FFFFFF"
+textColor = "#0F172A"
+font = "sans serif"
