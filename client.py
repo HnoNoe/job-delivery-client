@@ -470,7 +470,17 @@ class App(tk.Tk):
         if config.SAFE_MODE:
             self.lbl_safe.config(text="⚠ 安全模式已开启：投递只演练不真发（改 config.py 的 SAFE_MODE=False 才会真实投递）",
                                  foreground="#a60")
-        else:
+            return
+        try:
+            import delivery
+            remaining = max(0, config.DAILY_SEND_LIMIT - delivery._daily_sends())
+            self.lbl_safe.config(text=(
+                "⚠ 安全模式已关闭：将真实投递，封号风险自负！ ｜ 节奏：每条随机 %d~%d 秒 ｜ "
+                "今日剩余额度 %d/%d 条 ｜ 连续失败 %d 条自动熔断"
+                % (config.DELIVER_INTERVAL_MIN, config.DELIVER_INTERVAL_MAX,
+                   remaining, config.DAILY_SEND_LIMIT, config.MAX_CONSECUTIVE_FAILS)),
+                foreground="#c00")
+        except Exception:
             self.lbl_safe.config(text="⚠ 安全模式已关闭：将真实投递，封号风险自负！", foreground="#c00")
 
     def _maketasks(self):
@@ -501,6 +511,7 @@ class App(tk.Tk):
             for tid, ok, msg in res.get("明细", []):
                 log("  任务%s %s %s" % (tid, "✅" if ok else "❌", msg))
             self.event_generate("<<tasks-changed>>")
+            self.after(0, self._refresh_safe)  # 投递后刷新今日剩余额度
         self._run(work)
 
     # ---------- ⑥ 任务追踪 ----------

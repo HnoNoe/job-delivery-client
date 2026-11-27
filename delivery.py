@@ -282,15 +282,36 @@ def record_manual_delivery(task_id):
     return True, "已记录手动投递"
 
 
+def _next_delay(kind="batch"):
+    """下一条投递前的随机等待秒数（batch=批量投递，all=全部投递）。
+
+    随机区间模拟人手节奏——固定间隔是自动化最典型的风控特征。
+    """
+    import random
+    if kind == "all":
+        lo = min(config.DELIVER_INTERVAL_ALL_MIN, config.DELIVER_INTERVAL_ALL_MAX)
+        hi = max(config.DELIVER_INTERVAL_ALL_MIN, config.DELIVER_INTERVAL_ALL_MAX)
+    else:
+        lo = min(config.DELIVER_INTERVAL_MIN, config.DELIVER_INTERVAL_MAX)
+        hi = max(config.DELIVER_INTERVAL_MIN, config.DELIVER_INTERVAL_MAX)
+    return random.uniform(lo, hi)
+
+
+def _pace(kind="batch"):
+    """按节奏等待（实际睡眠）。"""
+    time.sleep(_next_delay(kind))
+
+
 def deliver_batch(task_ids=None, stop_on_risk=True, limit=None, interval=None,
                   all_pending=False):
     """批量投递（一口气投多个，针对 Boss 直聘「立即沟通」通道）。
 
     - 安全模式下拒绝真正批量投递（提示关闭 SAFE_MODE），绝不假装投递。
-    - 受每日上限 DAILY_SEND_LIMIT、单次批次上限 BATCH_SEND_LIMIT、限速 DELIVER_INTERVAL 三重保护；
-    - all_pending=True 时不受单批上限约束（「全部投递」用），仍受每日上限约束；
-    - interval 可覆盖每条之间的间隔（「全部投递」用更长的 DELIVER_INTERVAL_ALL）。
-    - 检测到风控/封号/登录失效信号时立即停止，避免账号被封。
+    - 受每日上限 DAILY_SEND_LIMIT、单次批次上限 BATCH_SEND_LIMIT、随机限速（20~60s）三重保护；
+    - all_pending=True 时不受单批上限约束（「全部投递」用），仍受每日上限约束，
+      且用更长的随机间隔（45~120s）；
+    - 检测到风控/封号/登录失效信号立即停止；连续失败 MAX_CONSECUTIVE_FAILS 条也熔断停批。
+    - interval 参数已废弃（保留兼容），节奏统一走 config 随机区间。
 
     返回 dict：{投递数, 成功数, 失败数, 停止原因, 明细:[(task_id, ok, msg)]}
     """
@@ -366,24 +387,36 @@ def deliver_batch(task_ids=None, stop_on_risk=True, limit=None, interval=None,
     ok_count = fail_count = 0
     stop_reason = ""
     by_entry = {}
+    consecutive_fails = 0
+    risk_words = ("验证", "风控", "登录失效", "登录态失效", "封号", "封禁",
+                  "账号异常", "操作频繁", "Code 3", "code 3")
     for i, tid in enumerate(pending[:budget]):
         by_entry[entry_of.get(tid, "半自动")] = by_entry.get(entry_of.get(tid, "半自动"), 0) + 1
         ok, msg = deliver_one(tid)
         details.append((tid, ok, msg))
         if ok:
             ok_count += 1
+            consecutive_fails = 0
         else:
             fail_count += 1
+            consecutive_fails += 1
             # 只有明确的平台风控/登录失效信号才熔断；
             # 「招呼语未确认，请人工核对」属于“待核实”，不能当成风控，否则整批会被一条不确定消息掐断。
-            risk_words = ("验证", "风控", "登录失效", "登录态失效", "封号", "封禁",
-                          "账号异常", "操作频繁", "Code 3", "code 3")
             if stop_on_risk and any(k in str(msg) for k in risk_words):
                 stop_reason = "检测到风控/封号信号，已停止批量投递：%s" % str(msg)[:60]
                 break
-        # 两条之间的限速间隔（防封号）；「全部投递」用更长的间隔
+            # 连败熔断：连续多条失败说明环境已异常（登录态掉了/页面改版/网络坏），
+            # 继续顶着重试只会放大风控风险
+            if consecutive_fails >= getattr(config, "MAX_CONSECUTIVE_FAILS", 3):
+                stop_reason = "连续 %d 条投递失败，已熔断停批（最近失败：%s）" % (
+                    consecutive_fails, str(msg)[:50])
+                break
+        # 两条之间的随机限速（防封号）；「全部投递」用更长区间
         if i < budget - 1:
-            time.sleep(config.DELIVER_INTERVAL if interval is None else max(0, int(interval)))
+            if interval is not None:
+                time.sleep(max(0, int(interval)))  # 兼容旧调用（测试/脚本指定）
+            else:
+                _pace("all" if all_pending else "batch")
 
     return {"投递数": len(details), "成功数": ok_count, "失败数": fail_count,
             "停止原因": stop_reason, "明细": details, "按渠道": by_entry}

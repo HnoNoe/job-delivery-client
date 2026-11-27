@@ -90,12 +90,19 @@ BATCH_SEND_LIMIT = 5    # 单次最多投递条数
 # 安全模式：默认开启。开启时「投递」只生成材料+招呼语，绝不自动点立即沟通/发消息给HR。
 # 能力已在代码里（delivery.deliver_one + session.dpage_deliver/dpage_greet），
 # 只有你明确把 SAFE_MODE 设为 False 才会真正执行自动投递。
-SAFE_MODE = True
+SAFE_MODE = False
 
-# 每轮投递间隔（秒），降低被封风险（即使关闭安全模式）
+# 每轮投递间隔（秒）——随机区间，模拟人手节奏，固定间隔反而是风控特征。
+# 批量投递：每条之间随机停 20~60 秒；「全部投递」用更长的 45~120 秒。
+DELIVER_INTERVAL_MIN = int(os.environ.get("JOBDELIVERY_DELIVER_INTERVAL_MIN", "20"))
+DELIVER_INTERVAL_MAX = int(os.environ.get("JOBDELIVERY_DELIVER_INTERVAL_MAX", "60"))
+DELIVER_INTERVAL_ALL_MIN = int(os.environ.get("JOBDELIVERY_DELIVER_INTERVAL_ALL_MIN", "45"))
+DELIVER_INTERVAL_ALL_MAX = int(os.environ.get("JOBDELIVERY_DELIVER_INTERVAL_ALL_MAX", "120"))
+# 兼容旧调用：固定值已不再用于批量间隔，仅保留给单条内「点击后等确认」等短等待
 DELIVER_INTERVAL = 8
-# 「全部投递」模式的间隔（更长，降低连续投递风控概率）
-DELIVER_INTERVAL_ALL = int(os.environ.get("JOBDELIVERY_DELIVER_INTERVAL_ALL", "20"))
+
+# 熔断：连续失败达到该条数立即停批（防账号异常时被程序顶着风控硬冲）
+MAX_CONSECUTIVE_FAILS = 3
 
 # ---------- 投递地址校验（防 SSRF / 个人信息外发到内网）----------
 # 采集来的「投递入口地址」属于不可信数据：默认只允许 http/https 的公网地址。

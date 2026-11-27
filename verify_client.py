@@ -99,6 +99,11 @@ def main():
     delivery.config.SAFE_MODE = True  # 回归测试强制安全模式，与部署配置无关
     res = delivery.deliver_batch(limit=1)
     check("安全模式拦截真实投递", res["投递数"] == 0 and "安全模式" in res["停止原因"])
+    print("=== 投递节奏控制 ===")
+    check("批量间隔在 20~60 秒区间", all(20 <= delivery._next_delay("batch") <= 60 for _ in range(50)))
+    check("全部投递间隔在 45~120 秒区间", all(45 <= delivery._next_delay("all") <= 120 for _ in range(50)))
+    check("熔断阈值已配置(>=2)", config.MAX_CONSECUTIVE_FAILS >= 2)
+    check("每日上限已配置(>0)", config.DAILY_SEND_LIMIT > 0)
 
     print()
     print("=== 客户端回归", "通过 ===" if ok else "存在 FAIL ===")
