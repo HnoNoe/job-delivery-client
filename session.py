@@ -893,6 +893,9 @@ def qr_login_shot(platform_key, reload=False):
     """截取当前登录页二维码，返回 (ok, 图片路径 | 错误信息)。
 
     reload=True 时重新加载登录页（二维码过期后换新码）。
+    Boss 直聘要点：登录页默认停在短信面板（需切「APP扫码登录」页签）；
+    新加载页面下发的码可能在十几秒内被判过期（遮罩盖住二维码），
+    所以截图后必须复查遮罩，无效则点「点击刷新」换新码重截，最多 3 轮。
     """
     page = _DPAGES.get(platform_key)
     if not page or not _page_alive(page):
@@ -904,21 +907,95 @@ def qr_login_shot(platform_key, reload=False):
             page.wait(2)
         except Exception:
             pass
+    # 有的平台（如 Boss 直聘）登录页默认停在短信验证码面板，二维码藏在
+    # 「APP扫码登录」页签下：切过去再截，否则永远截不到二维码
+    tab_text = (p or {}).get("login_qr_tab_text")
+    refresh_sel = (p or {}).get("login_qr_refresh_selector")
+
+    def _switch_tab():
+        if not tab_text:
+            return
+        try:
+            tab = page.ele("text:%s" % tab_text, timeout=2)
+            if tab:
+                tab.click()
+                page.wait(1)
+        except Exception:
+            pass
+
+    def _invalid_visible():
+        try:
+            return bool(page.ele("css:.invalid-box", timeout=1))
+        except Exception:
+            return False
+
+    def _click_refresh():
+        if not refresh_sel:
+            return False
+        try:
+            btn = page.ele("css:%s" % refresh_sel, timeout=2)
+            if not btn:
+                return False
+            btn.click()
+            page.wait(3)
+            return True
+        except Exception:
+            return False
+
+    # DrissionPage 对不带模式前缀且含空格的 locator 会当成文本查找：
+    # 配置里的 CSS 选择器必须补 css: 前缀，否则永远找不到元素
+    qr_sel = (p or {}).get("login_qr_selector", "img, canvas")
+    if not qr_sel.startswith(("css:", "xpath:", "text:", "tag:", "id:", "class:")):
+        qr_sel = "css:" + qr_sel
+
     name = "%s_qr_live.png" % platform_key
     shot = SESSION_DIR / name
-    try:
-        ele = page.ele(p.get("login_qr_selector", "img, canvas"), timeout=3)
-        if ele:
-            ele.get_screenshot(path=str(SESSION_DIR), name=name)
-        else:
-            page.get_screenshot(path=str(SESSION_DIR), name=name)  # 兜底整页
-        return True, str(shot)
-    except Exception:
+    _switch_tab()
+    for attempt in range(3):
+        if _invalid_visible():
+            _click_refresh()
+        # 主路径：直接读二维码 <img> 的 blob 源（0 秒完成、不触发渲染，
+        # 实测 CDP 截图在隐藏窗口上耗时 27 秒且会触发平台把二维码判过期）
+        saved = False
         try:
-            page.get_screenshot(path=str(SESSION_DIR), name=name)
+            data = page.run_js(
+                """
+                const img = document.querySelector(%s);
+                if (!img || !img.src) return null;
+                return fetch(img.src).then(r => r.blob()).then(b => {
+                  return new Promise(res => {
+                    const fr = new FileReader();
+                    fr.onload = () => res(fr.result);
+                    fr.readAsDataURL(b);
+                  });
+                });
+                """ % json.dumps(qr_sel[4:] if qr_sel.startswith("css:") else qr_sel),
+                timeout=15)
+            if data and "," in data:
+                import base64
+                shot.write_bytes(base64.b64decode(data.split(",", 1)[1]))
+                saved = True
+        except Exception:
+            saved = False
+        if not saved:
+            try:
+                ele = page.ele(qr_sel, timeout=3)
+                if not ele and attempt == 0:
+                    _switch_tab()  # 首次没找到再切一次页签兜底
+                    ele = page.ele(qr_sel, timeout=3)
+                if ele:
+                    ele.get_screenshot(path=str(SESSION_DIR), name=name)
+                else:
+                    page.get_screenshot(path=str(SESSION_DIR), name=name)  # 兜底整页
+            except Exception:
+                try:
+                    page.get_screenshot(path=str(SESSION_DIR), name=name)
+                except Exception as exc:
+                    return False, "截图失败：%s" % exc
+        # 截图后复查遮罩：无效则刷新重取，最多 3 轮
+        if not _invalid_visible():
             return True, str(shot)
-        except Exception as exc:
-            return False, "截图失败：%s" % exc
+    return True, str(shot)  # 尽力而为：3 轮后仍无效也返回最后一张，界面可手动刷新
 
 
 def qr_login_status(platform_key):

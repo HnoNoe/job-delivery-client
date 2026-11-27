@@ -52,7 +52,9 @@ PLATFORMS = {
     "boss": {
         "name": "Boss直聘",
         "login_url": "https://www.zhipin.com/web/user/?ka=header-login",
-        "login_qr_selector": "img.qrcode-img, canvas.qrcode-canvas, .qrcode img",
+        "login_qr_selector": ".qr-img-box img, img.qrcode-img, canvas.qrcode-canvas",
+        "login_qr_tab_text": "APP扫码登录",
+        "login_qr_refresh_selector": "button[ka='refresh_app_sao_qrcode']",
         "search_url": "https://www.zhipin.com/web/geek/job?query={keyword}&city={city}&page={page}",
         "item_selector": "li.job-card-wrapper",
         "fields": {
