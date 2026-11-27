@@ -1,0 +1,4 @@
+# 唯一必需的第三方依赖：连接 Chrome 调试端口
+websocket-client>=1.6.0
+# 导出 Excel 需要（没有也能跑，只是不生成 xlsx）
+openpyxl>=3.1.0
