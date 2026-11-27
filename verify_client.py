@@ -1,10 +1,14 @@
 """客户端无头回归：账号 → 简历 → 抓取(mock) → 建任务 → 投递 → 任务追踪。
 
 运行：python verify_client.py（改 auth/resume_store/delivery 后必跑）。
+注意：本文件须最先设置 JOBDELIVERY_DB（在任何项目 import 之前），否则配置快照不生效。
 """
 import json
 import os
 import sys
+
+os.environ["JOBDELIVERY_DB"] = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "data", "_verify_client.db"))
 
 import auth
 import config
@@ -24,8 +28,9 @@ def main():
             ok = False
 
     db.init_db()
-    # 独立测试库，不污染真实数据
-    os.environ["JOBDELIVERY_DB"] = os.path.join(config.DATA_DIR, "_verify_client.db")
+    # 独立测试库（导入前已设 JOBDELIVERY_DB），每次重建保证幂等
+    if os.path.exists(os.environ["JOBDELIVERY_DB"]):
+        os.remove(os.environ["JOBDELIVERY_DB"])
     db.init_db()
 
     print("=== 账号 ===")

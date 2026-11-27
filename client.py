@@ -130,7 +130,8 @@ class App(tk.Tk):
         bf = ttk.Frame(f); bf.grid(row=base + 2, column=1, columnspan=4, sticky="w", pady=4)
         ttk.Button(bf, text="添加经历", command=self._exp_add).pack(side="left", padx=4)
         ttk.Button(bf, text="删除选中", command=self._exp_del).pack(side="left", padx=4)
-        ttk.Button(bf, text="保存简历", command=self._resume_save).pack(side="left", padx=16)
+        ttk.Button(bf, text="导入简历(AI识别)", command=self._resume_import).pack(side="left", padx=16)
+        ttk.Button(bf, text="保存简历", command=self._resume_save).pack(side="left", padx=4)
         ttk.Button(bf, text="重新加载", command=self._resume_load).pack(side="left", padx=4)
 
     def _exp_add(self):
@@ -158,6 +159,52 @@ class App(tk.Tk):
             self.tree_exp.delete(sel)
             if 0 <= idx < len(self.exp_rows):
                 self.exp_rows.pop(idx)
+
+    def _resume_import(self):
+        if not self.user:
+            messagebox.showwarning("简历", "请先登录"); return
+        from tkinter import filedialog
+        path = filedialog.askopenfilename(
+            title="选择简历文件",
+            filetypes=[("简历文件", "*.txt *.md *.pdf *.docx"), ("所有文件", "*.*")])
+        if not path:
+            return
+        log("识别简历中：%s ..." % path)
+
+        def work():
+            try:
+                import resume_ai
+                text = resume_ai.extract_text(path)
+                parsed = resume_ai.smart_parse(text)
+            except Exception as e:
+                log("识别失败：%s" % e)
+                return
+            if not parsed:
+                log("未能从文件中识别出字段")
+                return
+            self.event_generate("<<resume-parsed>>")
+            # 回填到界面（主线程安全：用 after 包一层）
+            def fill():
+                for k, e in self.ent_l0.items():
+                    if k in parsed:
+                        e.delete(0, "end"); e.insert(0, str(parsed[k]))
+                if parsed.get("意向岗位"):
+                    self.ent_intent.delete(0, "end")
+                    self.ent_intent.insert(0, parsed["意向岗位"])
+                if parsed.get("技能"):
+                    log("识别技能：%s" % "、".join(parsed["技能"]))
+                for i in self.tree_exp.get_children():
+                    self.tree_exp.delete(i)
+                self.exp_rows = list(parsed.get("经历", []))
+                for row in self.exp_rows:
+                    self.tree_exp.insert("", "end", values=(
+                        row.get("类型", ""), row.get("名称", ""), row.get("角色", ""),
+                        "%s~%s" % (row.get("时间起", ""), row.get("时间止", "")),
+                        row.get("技术工具", "")))
+                log("识别完成：%d 个字段、%d 条经历，核对后点「保存简历」"
+                    % (len([k for k in parsed if k != "经历"]), len(self.exp_rows)))
+            self.after(0, fill)
+        self._run(work)
 
     def _resume_save(self):
         if not self.user:

@@ -4,3 +4,4 @@ data/
 *.spec
 build/
 dist/
+secrets_local.py
