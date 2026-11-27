@@ -81,7 +81,7 @@ class App(tk.Tk):
         ttk.Label(f, text="密码：").grid(row=1, column=0, padx=10, pady=10, sticky="e")
         self.ent_user = ttk.Entry(f, width=28); self.ent_user.grid(row=0, column=1, sticky="w")
         self.ent_pwd = ttk.Entry(f, width=28, show="*"); self.ent_pwd.grid(row=1, column=1, sticky="w")
-        ttk.Button(f, text="注册", command=self._register).grid(row=0, column=2, padx=8)
+        ttk.Button(f, text="注册", command=self._do_register).grid(row=0, column=2, padx=8)
         ttk.Button(f, text="登录", command=self._login).grid(row=1, column=2, padx=8)
         ttk.Button(f, text="退出登录", command=self._logout).grid(row=2, column=2, padx=8)
         self.lbl_user = ttk.Label(f, text="未登录", foreground="#0a6")
@@ -89,7 +89,7 @@ class App(tk.Tk):
         ttk.Label(f, text="提示：各账号的简历/任务数据互相隔离；账号只存本地数据库。",
                   foreground="#888").grid(row=3, column=0, columnspan=3, padx=10, pady=10, sticky="w")
 
-    def _register(self):
+    def _do_register(self):
         ok, msg = auth.register(self.ent_user.get(), self.ent_pwd.get())
         log(msg); messagebox.showinfo("注册", msg)
         self._refresh_user_state()
@@ -190,7 +190,7 @@ class App(tk.Tk):
     # ---------- ③ 抓取岗位 ----------
     def _build_search(self):
         f = self.tab_search
-        keys = [k for k, _ in platforms.list_platforms()]
+        keys = list(platforms.PLATFORMS.keys())
         ttk.Label(f, text="平台：").grid(row=0, column=0, padx=8, pady=8, sticky="e")
         self.cmb_platform = ttk.Combobox(f, values=keys, state="readonly", width=12)
         self.cmb_platform.set("boss"); self.cmb_platform.grid(row=0, column=1, sticky="w")
