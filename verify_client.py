@@ -14,6 +14,7 @@ import auth
 import config
 import db
 import jobstore
+import login_status
 import resume_store
 
 
@@ -60,6 +61,22 @@ def main():
     other = resume_store.load_resume("另一个人")
     check("账号数据隔离（他人简历独立）",
           other is None or other["l0"].get("学校") != "四川大学")
+
+    print("=== 平台登录（无浏览器路径）===")
+    import client
+    import session
+    for key in list(__import__("platforms").PLATFORMS.keys()):
+        st = login_status.check_platform(key, online=False)
+        check("%s 状态检测结构完整" % key,
+              isinstance(st, dict) and st["state"] in login_status.STATE_LABEL
+              and st["label"] and "checked_at" in st, st)
+    check("无浏览器时扫码状态=未登录", session.qr_login_status("boss") is False)
+    okf, msgf = session.dpage_finish("boss")
+    check("无浏览器时完成登录给出可读提示", okf is False and "未找到登录会话" in msgf, msgf)
+    session.clear_session("boss")  # 不存在的平台也不能抛异常
+    check("clear_session 对无登录态平台安全", True)
+    check("client 模块可导入（含平台登录页签）",
+          hasattr(client, "App") and hasattr(client.App, "_build_plogin"))
 
     print("=== 抓取→建任务→投递 ===")
     auth.login("测试员", "abc12345")

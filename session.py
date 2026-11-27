@@ -1011,7 +1011,7 @@ def dpage_search(platform_key, keyword, city="", pages=1):
             _expired = _cfg["value"] in page.url
         if _expired:
             clear_session(platform_key)
-            reason = "登录态已失效（被重定向到登录页），请回第②步重新扫码登录"
+            reason = "登录态已失效（被重定向到登录页），请到「平台登录」页签重新扫码登录"
             debug.append("登录态失效，已重定向到登录页")
             return []
         # 滚动触发无限滚动翻页（Boss直聘靠滚动加载更多）
@@ -1153,9 +1153,12 @@ def dpage_deliver(platform_key, job_link):
     try:
         page.get(job_link)
         page.wait(3)
-        # 登录态失效检测：导航后被重定向到登录页
+        # 登录态失效检测：导航后被重定向到登录页。
+        # 与检索一致：清掉本地登录态标记并记录原因，界面据此引导一键重登。
         if "/web/user" in page.url or "login" in page.url.lower():
-            return False, "登录态失效，请重新扫码登录"
+            clear_session(platform_key)
+            _LAST_SEARCH_ERROR[platform_key] = "登录态已失效（被重定向到登录页），请到「平台登录」页签重新扫码"
+            return False, "登录态失效，请到「平台登录」页签重新扫码登录"
         r = str(page.run_js("""
             const selectors = %s;
             const texts = %s;
@@ -1449,7 +1452,7 @@ def chat_capture(platform_key, timeout=12, wait=None):
         cfg = p.get("login_check", {})
         if cfg.get("type") == "url_not_contains" and cfg.get("value", "") in page.url:
             clear_session(platform_key)
-            return False, [], [], ["登录态已失效（被重定向到登录页），请回第②步重新扫码"]
+            return False, [], [], ["登录态已失效（被重定向到登录页），请到「平台登录」页签重新扫码"]
         debug.append("导航方式: %s | URL: %s" % ("点击消息入口" if nav_clicked else "直接打开",
                                               page.url[:110]))
         # 会话列表由 WebSocket 推送：等它渲染出来（Boss 实测需 ~10s）

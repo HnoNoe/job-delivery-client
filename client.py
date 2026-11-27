@@ -18,6 +18,7 @@ import login_status
 import platforms
 import resume_store
 import schema
+import session
 
 log_queue = queue.Queue()
 
@@ -33,18 +34,20 @@ class App(tk.Tk):
         self.geometry("900x640")
         self.user = auth.current_user()
         self.exp_rows = []  # 简历页经历列表（dict）
+        self._qr_win = None  # 扫码登录窗口（同时只允许一个）
 
         nb = ttk.Notebook(self)
         nb.pack(fill="both", expand=True)
         self.nb = nb
         self.tab_account = ttk.Frame(nb); nb.add(self.tab_account, text="① 账号")
         self.tab_resume = ttk.Frame(nb);  nb.add(self.tab_resume, text="② 简历")
-        self.tab_search = ttk.Frame(nb);  nb.add(self.tab_search, text="③ 抓取岗位")
-        self.tab_deliver = ttk.Frame(nb); nb.add(self.tab_deliver, text="④ 投递")
-        self.tab_tasks = ttk.Frame(nb);   nb.add(self.tab_tasks, text="⑤ 任务追踪")
+        self.tab_plogin = ttk.Frame(nb);  nb.add(self.tab_plogin, text="③ 平台登录")
+        self.tab_search = ttk.Frame(nb);  nb.add(self.tab_search, text="④ 抓取岗位")
+        self.tab_deliver = ttk.Frame(nb); nb.add(self.tab_deliver, text="⑤ 投递")
+        self.tab_tasks = ttk.Frame(nb);   nb.add(self.tab_tasks, text="⑥ 任务追踪")
 
-        self._build_account(); self._build_resume(); self._build_search()
-        self._build_deliver(); self._build_tasks()
+        self._build_account(); self._build_resume(); self._build_plogin()
+        self._build_search(); self._build_deliver(); self._build_tasks()
 
         self.logbox = scrolledtext.ScrolledText(self, height=8, state="disabled")
         self.logbox.pack(fill="x", side="bottom")
@@ -234,7 +237,177 @@ class App(tk.Tk):
                 "%s~%s" % (row.get("时间起", ""), row.get("时间止", "")), row.get("技术工具", "")))
         log("简历已加载")
 
-    # ---------- ③ 抓取岗位 ----------
+    # ---------- ③ 平台登录 ----------
+    def _build_plogin(self):
+        f = self.tab_plogin
+        ttk.Label(f, text="平台：").grid(row=0, column=0, padx=10, pady=10, sticky="e")
+        self.cmb_pl = ttk.Combobox(f, values=list(platforms.PLATFORMS.keys()),
+                                   state="readonly", width=12)
+        self.cmb_pl.set("boss")
+        self.cmb_pl.grid(row=0, column=1, sticky="w")
+        self.cmb_pl.bind("<<ComboboxSelected>>", lambda _e: self._pl_status_refresh())
+        self.lbl_pl_status = ttk.Label(f, text="未检测", foreground="#888")
+        self.lbl_pl_status.grid(row=0, column=2, columnspan=3, padx=8, sticky="w")
+        ttk.Button(f, text="刷新状态", command=self._pl_status_refresh).grid(row=0, column=5, padx=6)
+
+        ttk.Button(f, text="扫码登录", command=self._pl_login_start).grid(row=1, column=0, padx=10, pady=6)
+        ttk.Label(f, text="打开登录浏览器并在这里展示二维码，手机扫码后自动保存登录态",
+                  foreground="#888").grid(row=1, column=1, columnspan=4, sticky="w")
+        ttk.Button(f, text="在浏览器窗口中打开", command=self._pl_open_window).grid(row=2, column=0, padx=10, pady=6)
+        ttk.Label(f, text="把登录浏览器窗口显示到桌面，适合直接对着窗口扫码",
+                  foreground="#888").grid(row=2, column=1, columnspan=4, sticky="w")
+        ttk.Button(f, text="退出该平台登录", command=self._pl_logout).grid(row=3, column=0, padx=10, pady=6)
+        ttk.Label(f, text="清掉该平台登录态并关闭其浏览器（不影响其他平台）",
+                  foreground="#888").grid(row=3, column=1, columnspan=4, sticky="w")
+        ttk.Label(f, text="登录一次后浏览器保持驻留（屏幕外运行），检索/投递复用同一会话——"
+                          "全程同一指纹，风控不易吊销。登录态被平台判失效时，"
+                          "「抓取岗位」会提示回到本页签一键重登。",
+                  foreground="#0a6", wraplength=620).grid(row=4, column=0, columnspan=6,
+                                                          padx=10, pady=12, sticky="w")
+        self._pl_status_refresh()
+
+    def _pl_status_refresh(self):
+        key = self.cmb_pl.get()
+        colors = {"ok": "#0a6", "warn": "#a60", "bad": "#c00", "off": "#888"}
+
+        def work():
+            try:
+                st = login_status.check_platform(key, online=False)
+            except Exception as exc:
+                self.after(0, lambda: self.lbl_pl_status.config(
+                    text="检测失败：%s" % exc, foreground="#c00"))
+                return
+            self.after(0, lambda: self.lbl_pl_status.config(
+                text="%s ｜ %s" % (st["label"], st["detail"]),
+                foreground=colors.get(st["kind"], "#888")))
+        self._run(work)
+
+    def _pl_login_start(self):
+        key = self.cmb_pl.get()
+        if self._qr_win is not None and self._qr_win.winfo_exists():
+            self._qr_win.lift()
+            return
+        log("正在打开 %s 登录页..." % key)
+
+        def work():
+            try:
+                ok, msg = session.qr_login_start(key)
+            except Exception as exc:
+                err = str(exc)
+                def fail():
+                    log("打开登录页失败：%s" % err)
+                    messagebox.showwarning("平台登录",
+                                           "打开登录页失败：%s\n\n如提示依赖缺失，请安装 requirements-browser.txt" % err)
+                self.after(0, fail)
+                return
+            self.after(0, lambda: (log("[%s] %s" % (key, msg)), self._qr_open(key)))
+        self._run(work)
+
+    def _qr_open(self, key):
+        win = tk.Toplevel(self)
+        win.title("%s 扫码登录" % key)
+        win.geometry("380x560")
+        win.protocol("WM_DELETE_WINDOW", win.destroy)
+        self._qr_win = win
+        lbl_img = ttk.Label(win)
+        lbl_img.pack(pady=10)
+        lbl_tip = ttk.Label(win, text="请用手机 App 扫描二维码登录", foreground="#0a6")
+        lbl_tip.pack()
+        bf = ttk.Frame(win); bf.pack(pady=8)
+
+        def _load_img(path):
+            try:
+                img = tk.PhotoImage(file=path)
+                lbl_img.configure(image=img)
+                lbl_img.image = img  # 防 GC
+                return True
+            except Exception:
+                return False
+
+        state = {"tick": 0, "done": False}
+
+        def _poll():
+            if state["done"] or not win.winfo_exists():
+                return
+            state["tick"] += 1
+            try:
+                if session.qr_login_status(key):
+                    state["done"] = True
+                    lbl_tip.config(text="已扫码，正在保存登录态...", foreground="#0a6")
+                    def _finish():
+                        ok, msg = session.dpage_finish(key)
+                        log("[%s] %s" % (key, msg))
+                        self._pl_status_refresh()
+                        lbl_tip.config(text=("✅ " + msg) if ok else ("❌ " + msg),
+                                       foreground="#0a6" if ok else "#c00")
+                        if ok:
+                            win.after(1500, win.destroy)
+                    threading.Thread(target=_finish, daemon=True).start()
+                    return
+                # 二维码会过期：每 ~30s 刷新一次截图（需要时重载页面换新码）
+                if state["tick"] % 15 == 0:
+                    ok, payload = session.qr_login_shot(key, reload=(state["tick"] % 60 == 0))
+                    if ok:
+                        _load_img(payload)
+                    else:
+                        lbl_tip.config(text="二维码刷新中...", foreground="#a60")
+            except Exception:
+                pass
+            win.after(2000, _poll)
+
+        def _reshot():
+            ok, payload = session.qr_login_shot(key, reload=True)
+            if ok:
+                _load_img(payload)
+                lbl_tip.config(text="已换新二维码，请重新扫描", foreground="#0a6")
+            else:
+                lbl_tip.config(text="刷新失败：%s" % payload, foreground="#c00")
+        ttk.Button(bf, text="刷新二维码", command=_reshot).pack(side="left", padx=6)
+
+        def _open_window():
+            ok, msg = session.dpage_open(key)
+            log("[%s] %s" % (key, msg))
+            if ok:
+                lbl_tip.config(text="浏览器窗口已打开，可对着窗口扫码", foreground="#0a6")
+        ttk.Button(bf, text="在浏览器窗口打开", command=_open_window).pack(side="left", padx=6)
+
+        if key == "mock":
+            def _demo():
+                ok, msg = session.qr_login_demo_scan(key)
+                log("[%s] %s" % (key, msg))
+            ttk.Button(bf, text="模拟扫码", command=_demo).pack(side="left", padx=6)
+        ttk.Button(bf, text="关闭", command=win.destroy).pack(side="left", padx=6)
+
+        shot = session.SESSION_DIR / ("%s_qr_live.png" % key)
+        if not (_load_img(str(shot))):
+            lbl_tip.config(text="二维码加载中，稍后自动出现...", foreground="#a60")
+        win.after(2000, _poll)
+
+    def _pl_open_window(self):
+        key = self.cmb_pl.get()
+        log("正在打开 %s 登录浏览器窗口..." % key)
+
+        def work():
+            try:
+                ok, msg = session.dpage_open(key)
+            except Exception as exc:
+                self.after(0, lambda: (log("打开失败：%s" % exc),
+                                       messagebox.showwarning("平台登录", str(exc))))
+                return
+            self.after(0, lambda: log("[%s] %s" % (key, msg)))
+        self._run(work)
+
+    def _pl_logout(self):
+        key = self.cmb_pl.get()
+        if not messagebox.askyesno("平台登录", "确定退出 %s 的登录吗？\n"
+                                   "将清除本地登录态并关闭该平台浏览器。" % key):
+            return
+        session.clear_session(key)
+        session.dpage_quit(key)
+        log("已退出 %s 的登录" % key)
+        self._pl_status_refresh()
+
+    # ---------- ④ 抓取岗位 ----------
     def _build_search(self):
         f = self.tab_search
         keys = list(platforms.PLATFORMS.keys())
@@ -249,10 +422,10 @@ class App(tk.Tk):
         ttk.Label(f, text="城市代码（可空）：").grid(row=1, column=2, padx=8, sticky="e")
         self.ent_city = ttk.Entry(f, width=10); self.ent_city.grid(row=1, column=3, sticky="w")
         ttk.Button(f, text="开始检索", command=self._search).grid(row=0, column=4, rowspan=2, padx=16)
-        ttk.Label(f, text="检索到的岗位经高强度字段校验+去重后入库；真实平台请先登录并抓取登录态（见下方说明）。",
+        ttk.Label(f, text="检索到的岗位经高强度字段校验+去重后入库。",
                   foreground="#888", wraplength=560).grid(row=2, column=0, columnspan=5, padx=8, sticky="w")
-        ttk.Label(f, text="登录方式：在浏览器手动登录平台 → 终端执行 python main.py grab <平台>（Edge 需管理员）",
-                  foreground="#888", wraplength=560).grid(row=3, column=0, columnspan=5, padx=8, sticky="w")
+        ttk.Label(f, text="登录方式：先到「③ 平台登录」页签扫码登录，检索/投递会自动复用该登录态。",
+                  foreground="#0a6", wraplength=560).grid(row=3, column=0, columnspan=5, padx=8, sticky="w")
 
     def _search(self):
         if not self.user:
@@ -278,7 +451,7 @@ class App(tk.Tk):
                 log("未检索到岗位")
         self._run(work)
 
-    # ---------- ④ 投递 ----------
+    # ---------- ⑤ 投递 ----------
     def _build_deliver(self):
         f = self.tab_deliver
         self.lbl_safe = ttk.Label(f, text="")
@@ -330,7 +503,7 @@ class App(tk.Tk):
             self.event_generate("<<tasks-changed>>")
         self._run(work)
 
-    # ---------- ⑤ 任务追踪 ----------
+    # ---------- ⑥ 任务追踪 ----------
     def _build_tasks(self):
         f = self.tab_tasks
         self.lbl_counts = ttk.Label(f, text="")
