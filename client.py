@@ -6,6 +6,7 @@
 """
 import json
 import queue
+import re
 import threading
 import tkinter as tk
 from tkinter import ttk, messagebox, scrolledtext
@@ -16,6 +17,7 @@ import db
 import jobstore
 import login_status
 import platforms
+import resume_ai
 import resume_store
 import schema
 import session
@@ -52,6 +54,9 @@ class App(tk.Tk):
         self.logbox = scrolledtext.ScrolledText(self, height=8, state="disabled")
         self.logbox.pack(fill="x", side="bottom")
         self.after(200, self._drain_log)
+        # 后台识别结果经队列回到主线程处理（Tk 控件只能在主线程更新）
+        self._import_queue = queue.Queue()
+        self.after(150, self._drain_import)
         self._refresh_user_state()
 
     # ---------- 日志 ----------
@@ -123,38 +128,99 @@ class App(tk.Tk):
         self.ent_intent = ttk.Entry(f, width=40)
         self.ent_intent.grid(row=base, column=1, columnspan=3, padx=4, pady=3, sticky="w")
 
-        ttk.Label(f, text="经历（L2）：").grid(row=base + 1, column=0, padx=4, sticky="ne")
+        ttk.Label(f, text="技能：").grid(row=base + 1, column=0, padx=4, pady=3, sticky="e")
+        self.ent_skills = ttk.Entry(f, width=62)
+        self.ent_skills.grid(row=base + 1, column=1, columnspan=3, padx=4, pady=3, sticky="w")
+
+        ttk.Label(f, text="经历（L2）：").grid(row=base + 2, column=0, padx=4, sticky="ne")
         self.tree_exp = ttk.Treeview(f, columns=("类型", "名称", "角色", "时间", "技术工具"),
                                      show="headings", height=7)
         for cname, w in (("类型", 80), ("名称", 180), ("角色", 90), ("时间", 110), ("技术工具", 160)):
             self.tree_exp.heading(cname, text=cname)
             self.tree_exp.column(cname, width=w)
-        self.tree_exp.grid(row=base + 1, column=1, columnspan=4, padx=4, pady=3)
-        bf = ttk.Frame(f); bf.grid(row=base + 2, column=1, columnspan=4, sticky="w", pady=4)
+        self.tree_exp.grid(row=base + 2, column=1, columnspan=4, padx=4, pady=3)
+        self.tree_exp.bind("<Double-1>", lambda _e: self._exp_edit())
+        bf = ttk.Frame(f); bf.grid(row=base + 3, column=1, columnspan=4, sticky="w", pady=4)
         ttk.Button(bf, text="添加经历", command=self._exp_add).pack(side="left", padx=4)
         ttk.Button(bf, text="删除选中", command=self._exp_del).pack(side="left", padx=4)
-        ttk.Button(bf, text="导入简历(AI识别)", command=self._resume_import).pack(side="left", padx=16)
+        ttk.Button(bf, text="修改选中", command=self._exp_edit).pack(side="left", padx=4)
+        self.btn_import = ttk.Button(bf, text="导入简历(AI识别)", command=self._resume_import)
+        self.btn_import.pack(side="left", padx=16)
         ttk.Button(bf, text="保存简历", command=self._resume_save).pack(side="left", padx=4)
         ttk.Button(bf, text="重新加载", command=self._resume_load).pack(side="left", padx=4)
 
-    def _exp_add(self):
-        win = tk.Toplevel(self); win.title("添加经历"); win.grab_set()
-        ents = {}
+    # 这几项内容通常较长，用多行文本框；其余用单行输入框
+    _LONG_L2 = ("事项", "结果", "证据")
+
+    def _exp_values(self, row):
+        """L2 行 -> 表格显示值（表格只展示 5 列，其余字段仍存在 exp_rows 里）。"""
+        return (row.get("类型", ""), row.get("名称", ""), row.get("角色", ""),
+                "%s~%s" % (row.get("时间起", ""), row.get("时间止", "")),
+                row.get("技术工具", ""))
+
+    def _exp_insert(self, row):
+        self.exp_rows.append(row)
+        self.tree_exp.insert("", "end", values=self._exp_values(row))
+
+    def _exp_dialog(self, title, initial=None, on_ok=None):
+        """经历编辑对话框：添加/修改共用，initial 非空时预填原值。"""
+        win = tk.Toplevel(self); win.title(title); win.grab_set()
+        widgets = {}
         for i, name in enumerate(schema.L2_FIELDS):
-            ttk.Label(win, text=name + "：").grid(row=i, column=0, padx=6, pady=3, sticky="e")
-            e = ttk.Entry(win, width=40); e.grid(row=i, column=1, padx=6, pady=3)
-            ents[name] = e
+            ttk.Label(win, text=name + "：").grid(row=i, column=0, padx=6, pady=2, sticky="ne")
+            if name in self._LONG_L2:
+                w = tk.Text(win, width=46, height=6 if name == "事项" else 2, wrap="char")
+            else:
+                w = ttk.Entry(win, width=46)
+            w.grid(row=i, column=1, padx=6, pady=2, sticky="w")
+            widgets[name] = w
+            if initial and initial.get(name):
+                if isinstance(w, tk.Text):
+                    w.insert("1.0", initial[name])
+                else:
+                    w.insert(0, initial[name])
+
+        def read():
+            out = {}
+            for k, w in widgets.items():
+                out[k] = (w.get("1.0", "end-1c") if isinstance(w, tk.Text) else w.get()).strip()
+            return out
 
         def ok():
-            row = {k: e.get().strip() for k, e in ents.items()}
-            if not row.get("名称"):
-                messagebox.showwarning("经历", "名称不能为空", parent=win); return
-            self.exp_rows.append(row)
-            self.tree_exp.insert("", "end", values=(
-                row.get("类型", ""), row.get("名称", ""), row.get("角色", ""),
-                "%s~%s" % (row.get("时间起", ""), row.get("时间止", "")), row.get("技术工具", "")))
+            row = read()
+            if not (row.get("名称") or row.get("事项")):
+                messagebox.showwarning(title, "「名称」与「事项」至少填一个", parent=win)
+                return
+            if on_ok:
+                on_ok(row)
             win.destroy()
-        ttk.Button(win, text="确定", command=ok).grid(row=len(schema.L2_FIELDS), column=1, pady=8, sticky="e")
+
+        bar = ttk.Frame(win); bar.grid(row=len(schema.L2_FIELDS), column=1, pady=8, sticky="e")
+        ttk.Button(bar, text="确定", command=ok).pack(side="left", padx=6)
+        ttk.Button(bar, text="取消", command=win.destroy).pack(side="left", padx=6)
+        return win
+
+    def _exp_add(self):
+        self._exp_dialog("添加经历", None, lambda row: self._exp_insert(row))
+
+    def _exp_edit(self):
+        """修改选中的那条经历：改动写回 exp_rows 并原地刷新表格行。"""
+        sels = self.tree_exp.selection()
+        if not sels:
+            messagebox.showinfo("修改经历", "请先在上面的表格里选中一条经历")
+            return
+        item = sels[0]
+        idx = self.tree_exp.index(item)
+        if not (0 <= idx < len(self.exp_rows)):
+            return
+
+        def apply(row):
+            self.exp_rows[idx] = row
+            self.tree_exp.item(item, values=self._exp_values(row))
+            self.tree_exp.selection_set(item)
+            log("已修改经历：%s" % (row.get("名称") or row.get("事项", "")[:20]))
+
+        self._exp_dialog("修改经历", dict(self.exp_rows[idx]), apply)
 
     def _exp_del(self):
         for sel in self.tree_exp.selection():
@@ -163,7 +229,16 @@ class App(tk.Tk):
             if 0 <= idx < len(self.exp_rows):
                 self.exp_rows.pop(idx)
 
+    # ---------- 导入简历（双引擎 + 预览核对） ----------
+
+    _MODE_DESC = (
+        ("auto", "自动（推荐）", "先规则识别，再尝试 AI 补全；AI 不可用时降级并明确提示"),
+        ("rule", "纯规则", "完全离线，不访问任何模型接口"),
+        ("ai", "仅 AI", "只用 DeepSeek 抽取；未配置或失败会如实报错，不冒充规则结果"),
+    )
+
     def _resume_import(self):
+        """选文件 -> 选模式 -> 后台识别 -> 预览核对 -> 追加/替换。确认前不动主表单。"""
         if not self.user:
             messagebox.showwarning("简历", "请先登录"); return
         from tkinter import filedialog
@@ -172,48 +247,257 @@ class App(tk.Tk):
             filetypes=[("简历文件", "*.txt *.md *.pdf *.docx"), ("所有文件", "*.*")])
         if not path:
             return
-        log("识别简历中：%s ..." % path)
+        mode = self._ask_parse_mode()
+        if not mode:
+            return
+        self._start_import(path, mode)
+
+    def _ask_parse_mode(self):
+        """选择识别模式；取消返回 None。"""
+        win = tk.Toplevel(self); win.title("识别模式"); win.grab_set()
+        var = tk.StringVar(value=resume_ai.DEFAULT_MODE)
+        for i, (val, label, desc) in enumerate(self._MODE_DESC):
+            pad = 10 if i == 0 else 3
+            ttk.Radiobutton(win, text=label, value=val, variable=var).grid(
+                row=i, column=0, padx=10, pady=pad, sticky="w")
+            ttk.Label(win, text=desc, foreground="#888").grid(
+                row=i, column=1, padx=8, pady=pad, sticky="w")
+        chosen = {"mode": None}
+
+        def ok():
+            chosen["mode"] = var.get() or resume_ai.DEFAULT_MODE
+            win.destroy()
+
+        bar = ttk.Frame(win); bar.grid(row=len(self._MODE_DESC), column=0, columnspan=2,
+                                       pady=10, sticky="e")
+        ttk.Button(bar, text="开始识别", command=ok).pack(side="left", padx=6)
+        ttk.Button(bar, text="取消", command=win.destroy).pack(side="left", padx=6)
+        win.wait_window()
+        return chosen["mode"]
+
+    def _start_import(self, path, mode):
+        self._import_seq = getattr(self, "_import_seq", 0) + 1
+        seq, user = self._import_seq, self.user
+        if getattr(self, "btn_import", None) is not None:
+            self.btn_import.state(["disabled"])
+        log("识别简历（模式=%s）：%s ..." % (mode, path))
 
         def work():
+            res = err = None
             try:
-                import resume_ai
                 text = resume_ai.extract_text(path)
-                parsed = resume_ai.smart_parse(text)
+                res = resume_ai.smart_parse_ex(text, mode)
             except Exception as e:
-                log("识别失败：%s" % e)
+                err = e
+            self._import_queue.put((seq, user, path, res, err))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_import_done(self, seq, user, path, res, err):
+        if getattr(self, "btn_import", None) is not None:
+            self.btn_import.state(["!disabled"])
+        if seq != getattr(self, "_import_seq", 0):
+            log("已丢弃过期的识别结果（有更新的导入任务）"); return
+        if user != self.user:
+            log("账号已切换，丢弃本次识别结果"); return
+        if err is not None:
+            log("识别失败：%s" % err)
+            messagebox.showerror("识别失败", str(err)); return
+        if not res or not res.get("data"):
+            log("未能从文件中识别出字段"); return
+        self._show_import_preview(path, res["data"], res["meta"])
+
+    def _drain_import(self):
+        """主线程消费后台识别结果：过期任务/切换账号的结果在这里被丢弃。"""
+        try:
+            while True:
+                seq, user, path, res, err = self._import_queue.get_nowait()
+                self._on_import_done(seq, user, path, res, err)
+        except queue.Empty:
+            pass
+        except Exception as e:
+            log("处理识别结果出错：%s" % e)
+        self.after(150, self._drain_import)
+
+    def _show_import_preview(self, path, data, meta):
+        """预览核对窗：确认前不改动主表单、不清空已有经历。"""
+        rows = list(data.get("经历") or [])
+        warn_by_idx = {}
+        for w in meta.get("warnings") or []:
+            if w.get("candidate"):
+                warn_by_idx.setdefault(int(w["candidate"]), []).append(w.get("message", ""))
+        engine = {"rule": "纯规则", "hybrid": "规则 + AI"}.get(
+            meta.get("used_engine"), meta.get("used_engine") or "-")
+        ai_text = resume_ai.AI_STATUS.get(meta.get("ai_status"), meta.get("ai_status") or "-")
+        l0_count = len([k for k in data if k not in ("经历", "技能")])
+        fname = str(path).replace("\\", "/").split("/")[-1]
+
+        win = tk.Toplevel(self); win.title("识别结果预览（核对后再导入）"); win.grab_set()
+        win.geometry("1020x560")
+        ttk.Label(win, text="引擎：%s　AI 状态：%s" % (engine, ai_text),
+                  foreground="#0a6").grid(row=0, column=0, padx=10, pady=(8, 2), sticky="w")
+        ttk.Label(win, text="基本字段 %d 项　经历 %d 条　待核对 %d 条　技能 %d 项"
+                  % (l0_count, len(rows), len(warn_by_idx),
+                     len(data.get("技能") or []))).grid(
+            row=0, column=1, padx=10, pady=(8, 2), sticky="e")
+        ttk.Label(win, text="文件：%s" % fname, foreground="#888").grid(
+            row=1, column=0, columnspan=2, padx=10, sticky="w")
+
+        tree = ttk.Treeview(win, columns=("#", "类型", "名称", "角色", "时间", "技术工具", "核对"),
+                            show="headings", height=12)
+        for cname, w in (("#", 40), ("类型", 80), ("名称", 240), ("角色", 90),
+                         ("时间", 120), ("技术工具", 150), ("核对", 220)):
+            tree.heading(cname, text=cname); tree.column(cname, width=w)
+        tree.tag_configure("review", foreground="#c00")
+        tree.grid(row=2, column=0, padx=(10, 4), pady=4, sticky="nsew")
+
+        info = tk.Text(win, width=42, height=12, wrap="word")
+        info.grid(row=2, column=1, padx=(4, 10), pady=4, sticky="nsew")
+        win.rowconfigure(2, weight=1)
+        win.columnconfigure(0, weight=3); win.columnconfigure(1, weight=2)
+
+        items = []
+
+        def refresh_row(i):
+            r = rows[i]
+            notes = warn_by_idx.get(i + 1, [])
+            values = (i + 1, r.get("类型", ""), r.get("名称", ""), r.get("角色", ""),
+                      "%s~%s" % (r.get("时间起", ""), r.get("时间止", "")),
+                      r.get("技术工具", ""), "；".join(notes))
+            if items[i] is None:
+                items[i] = tree.insert("", "end", values=values,
+                                       tags=("review",) if (notes or not r.get("类型")) else ())
+            else:
+                tree.item(items[i], values=values)
+
+        for i in range(len(rows)):
+            items.append(None)
+            refresh_row(i)
+
+        lines = []
+        for w in meta.get("warnings") or []:
+            lines.append("提醒：%s" % w.get("message", ""))
+        un = meta.get("unmapped_content") or []
+        if un:
+            lines.append("")
+            lines.append("未映射内容（不会入库，需人工处理）：")
+            for u in un[:20]:
+                lines.append("  · %s —— %s" % (str(u.get("text", ""))[:40], u.get("reason", "")))
+        if meta.get("limitations"):
+            lines.append("")
+            lines.append("引擎限制：")
+            for l in meta["limitations"][:6]:
+                lines.append("  · %s" % l)
+        lines.append("")
+        lines.append("提示：双击表格中任意一行，可先修改该条经历再导入。")
+        info.insert("1.0", "\n".join(lines)); info.configure(state="disabled")
+
+        def edit_selected(_e=None):
+            sel = tree.selection()
+            if not sel:
                 return
-            if not parsed:
-                log("未能从文件中识别出字段")
+            i = items.index(sel[0])
+
+            def apply(row2):
+                rows[i] = row2
+                refresh_row(i)
+                log("已核对修改：%s" % (row2.get("名称") or row2.get("事项", "")[:20]))
+
+            self._exp_dialog("核对经历", dict(rows[i]), apply)
+
+        tree.bind("<Double-1>", edit_selected)
+
+        def finish(text_prefix):
+            log("%s｜来源 %s｜引擎 %s｜AI %s" % (text_prefix, fname, engine, ai_text))
+            self._log_import_meta(meta)
+            win.destroy()
+
+        def do_append():
+            added, skipped = self._append_experiences(rows)
+            self._fill_l0_blanks(data)
+            self._merge_skills(data.get("技能") or [])
+            finish("导入完成（追加）：新增 %d 条经历，跳过重复 %d 条" % (added, skipped))
+
+        def do_replace():
+            if not rows:
+                messagebox.showinfo("导入", "本次没有识别到经历，无法执行替换"); return
+            if not messagebox.askyesno(
+                    "替换经历", "将用本次识别的 %d 条经历替换现有 %d 条，是否继续？"
+                                % (len(rows), len(self.exp_rows))):
                 return
-            self.event_generate("<<resume-parsed>>")
-            # 回填到界面（主线程安全：用 after 包一层）
-            def fill():
-                for k, e in self.ent_l0.items():
-                    if k in parsed:
-                        e.delete(0, "end"); e.insert(0, str(parsed[k]))
-                if parsed.get("意向岗位"):
-                    self.ent_intent.delete(0, "end")
-                    self.ent_intent.insert(0, parsed["意向岗位"])
-                if parsed.get("技能"):
-                    log("识别技能：%s" % "、".join(parsed["技能"]))
-                for i in self.tree_exp.get_children():
-                    self.tree_exp.delete(i)
-                self.exp_rows = list(parsed.get("经历", []))
-                for row in self.exp_rows:
-                    self.tree_exp.insert("", "end", values=(
-                        row.get("类型", ""), row.get("名称", ""), row.get("角色", ""),
-                        "%s~%s" % (row.get("时间起", ""), row.get("时间止", "")),
-                        row.get("技术工具", "")))
-                log("识别完成：%d 个字段、%d 条经历，核对后点「保存简历」"
-                    % (len([k for k in parsed if k != "经历"]), len(self.exp_rows)))
-            self.after(0, fill)
-        self._run(work)
+            for i in self.tree_exp.get_children():
+                self.tree_exp.delete(i)
+            self.exp_rows = []
+            for r in rows:
+                self._exp_insert(dict(r))
+            self._fill_l0_blanks(data)
+            self._merge_skills(data.get("技能") or [])
+            finish("导入完成（替换）：现有经历 %d 条" % len(self.exp_rows))
+
+        bar = ttk.Frame(win); bar.grid(row=3, column=0, columnspan=2, pady=8, sticky="e")
+        ttk.Button(bar, text="追加导入", command=do_append).pack(side="left", padx=6)
+        btn_replace = ttk.Button(bar, text="替换全部经历", command=do_replace)
+        btn_replace.pack(side="left", padx=6)
+        if not rows:
+            btn_replace.state(["disabled"])
+        ttk.Button(bar, text="取消", command=win.destroy).pack(side="left", padx=6)
+        return win
+
+    def _fill_l0_blanks(self, data):
+        """基本字段只填空白，不覆盖用户已填内容。"""
+        filled, kept = [], []
+        for k, e in self.ent_l0.items():
+            v = str(data.get(k) or "").strip()
+            if not v:
+                continue
+            if e.get().strip():
+                kept.append(k); continue
+            e.delete(0, "end"); e.insert(0, v); filled.append(k)
+        intent = str(data.get("意向岗位") or "").strip()
+        if intent and not self.ent_intent.get().strip():
+            self.ent_intent.insert(0, intent); filled.append("意向岗位")
+        msg = "基本字段：填入 %d 项" % len(filled)
+        if kept:
+            msg += "，保留原值 %d 项（%s）" % (len(kept), "、".join(kept))
+        log(msg)
+
+    def _append_experiences(self, rows):
+        """追加导入：按 类型+名称+起始时间 去重，返回 (新增, 跳过)。"""
+        existing = {resume_ai.experience_signature(r) for r in self.exp_rows}
+        added = skipped = 0
+        for r in rows:
+            sig = resume_ai.experience_signature(r)
+            if sig in existing:
+                skipped += 1; continue
+            existing.add(sig)
+            self._exp_insert(dict(r)); added += 1
+        return added, skipped
+
+    def _merge_skills(self, skills):
+        if not skills:
+            return
+        cur = resume_ai.split_skills(self.ent_skills.get())
+        seen = {s.lower() for s in cur}
+        merged = list(cur)
+        for s in skills:
+            if s.lower() not in seen:
+                seen.add(s.lower()); merged.append(s)
+        self.ent_skills.delete(0, "end"); self.ent_skills.insert(0, "、".join(merged))
+
+    def _log_import_meta(self, meta):
+        for w in (meta.get("warnings") or [])[:8]:
+            log("  提醒：%s" % w.get("message", ""))
+        un = meta.get("unmapped_content") or []
+        if un:
+            log("  未映射 %d 项（未入库）：%s" % (len(un), "、".join(
+                str(u.get("text", ""))[:16] for u in un[:8])))
 
     def _resume_save(self):
         if not self.user:
             messagebox.showwarning("简历", "请先登录"); return
         parsed = {k: e.get().strip() for k, e in self.ent_l0.items()}
         parsed["意向岗位"] = self.ent_intent.get().strip()
+        parsed["技能"] = resume_ai.split_skills(self.ent_skills.get())
         parsed["经历"] = list(self.exp_rows)
         resume_store.save_resume(self.user, parsed)
         log("简历已保存（%d 条经历）" % len(self.exp_rows))
@@ -228,6 +512,8 @@ class App(tk.Tk):
         for k, e in self.ent_l0.items():
             e.delete(0, "end"); e.insert(0, data["l0"].get(k, ""))
         self.ent_intent.delete(0, "end"); self.ent_intent.insert(0, data.get("意向岗位", ""))
+        self.ent_skills.delete(0, "end")
+        self.ent_skills.insert(0, "、".join(data.get("技能") or []))
         for i in self.tree_exp.get_children():
             self.tree_exp.delete(i)
         self.exp_rows = list(data.get("experiences", []))
