@@ -83,6 +83,18 @@ PLATFORMS = {
             "公司": "brandName",
             "已沟通": "contact",
         },
+        # CDP 旁听采集配方（cdp_browser.goto 使用；2026-11-26 实测）
+        "capture": {
+            "search_url": "https://www.zhipin.com/web/geek/jobs?city={city}&query={keyword}",
+            "joblist_kw": "zpgeek/search/joblist.json",
+            "detail_url": "https://www.zhipin.com/job_detail/{job_id}.html",
+            "detail_kw": "zpgeek/job/detail.json",
+            "chat_url": "https://www.zhipin.com/web/geek/chat",
+            "chat_kw": "zprelation/friend/",
+            "needs_full_reload": True,
+            "page_interval": 12,
+            "max_pages": 5,
+        },
     },
     "zhilian": {
         "name": "智联招聘",
@@ -208,7 +220,8 @@ CHAT = {
         "chat_dom_selector": "li.chat-item",
     },
     "boss": {
-        "chat_url": "https://www.zhipin.com/web/chat/index",
+        # 实测：/web/chat/index 会被 _security_check 打回，正确路由是 /web/geek/chat
+        "chat_url": "https://www.zhipin.com/web/geek/chat",
         "chat_home_url": "https://www.zhipin.com/",
         "chat_listen_kw": "zpchat",
         "chat_item_selector": ".friend-content-warp",

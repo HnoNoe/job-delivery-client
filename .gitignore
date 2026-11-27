@@ -5,3 +5,15 @@ data/
 build/
 dist/
 secrets_local.py
+
+# 运行时数据（不要提交）
+logs/
+runtime/
+browser/
+*.log
+_research/
+
+# 独立采集工具的运行产物
+boss_crawler/browser_data/
+boss_crawler/output/
+boss_crawler/raw/

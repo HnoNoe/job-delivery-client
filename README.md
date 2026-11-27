@@ -40,3 +40,20 @@ python verify_db_strict.py  # 统一字段高强度校验
 
 本仓库 = [job-delivery-system](https://github.com/HnoNoe/job-delivery-system)（精简版 main）+ 本地账号/简历/界面层。
 核心采集/投递逻辑与精简版一致，升级内核时从这里同步对应模块即可。
+
+## BOSS直聘 通道（CDP 旁听）
+
+除原有 DrissionPage 链路外，新增一条更稳的 BOSS 采集/投递通道：用本机 Chrome 打开页面，
+只旁听浏览器自己发出的请求；投递用 CDP 注入可信鼠标事件（`isTrusted=true`）。
+原理、字段口径与限制见 [docs/boss/architecture.md](docs/boss/architecture.md)。
+
+```bash
+python main.py browser open boss          # 起浏览器并落到登录页（会记住 profile）
+python main.py login-check boss           # 登录态检查，可 --interval 轮询
+python main.py capture boss Python --city 101010100 --pages 1
+python main.py apply boss --limit 1       # 演练；加 --yes 才真正点击投递
+```
+
+另提供独立采集工具 `boss_crawler/`（零父仓库依赖，双击 `启动.bat` 可用中文菜单，
+输出 9 个工作表的 Excel），见 [boss_crawler/README.md](boss_crawler/README.md)。
+
