@@ -95,7 +95,9 @@ def main():
     nt = conn.execute("SELECT COUNT(*) c FROM delivery_tasks WHERE user_id=?", (uid,)).fetchone()["c"]
     conn.close()
     check("任务追踪查询（当前用户 2 条）", nt == 2, nt)
-    res = __import__("delivery").deliver_batch(limit=1)
+    import delivery
+    delivery.config.SAFE_MODE = True  # 回归测试强制安全模式，与部署配置无关
+    res = delivery.deliver_batch(limit=1)
     check("安全模式拦截真实投递", res["投递数"] == 0 and "安全模式" in res["停止原因"])
 
     print()
