@@ -78,6 +78,11 @@ def main():
     check("client 模块可导入（含平台登录页签）",
           hasattr(client, "App") and hasattr(client.App, "_build_plogin"))
 
+    print("=== 简历材料生成 ===")
+    import resume_pdf
+    pdf = resume_pdf.build_user_resume(uid)
+    check("简历PDF/TXT材料生成", bool(pdf) and os.path.exists(pdf), pdf)
+
     print("=== 抓取→建任务→投递 ===")
     auth.login("测试员", "abc12345")
     n = jobstore.store_jobs([

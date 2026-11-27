@@ -491,7 +491,22 @@ class App(tk.Tk):
 
         def work():
             created = jobs_to_tasks(uid)
-            log("新建 %d 个投递任务（已存在的自动跳过），到「任务追踪」查看" % created)
+            # 建任务的同时把投递材料备好：简历PDF + 各任务的 resume_path + 材料包/招呼语
+            import resume_pdf
+            pdf = resume_pdf.build_user_resume(uid)
+            conn = db.get_conn()
+            conn.execute(
+                "UPDATE delivery_tasks SET resume_path=? WHERE user_id=?"
+                " AND (resume_path IS NULL OR resume_path='')", (pdf, uid))
+            conn.commit()
+            ids = [r["task_id"] for r in conn.execute(
+                "SELECT task_id FROM delivery_tasks WHERE user_id=? AND status='待投递'",
+                (uid,)).fetchall()]
+            conn.close()
+            import delivery
+            report = delivery.prepare_batch(uid, ids) if ids else []
+            log("新建 %d 个投递任务；简历材料：%s；材料包 %d 份，到「任务追踪」查看"
+                % (created, pdf, len(report)))
         self._run(work)
 
     def _deliver(self, all_pending):
