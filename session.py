@@ -7,13 +7,17 @@
 4. 检测登录态（cookie/元素/URL），成功后保存会话
 5. 后续检索复用已保存会话，无需重复登录
 """
+import itertools
 import pickle
 import io
 import json
+import random
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
+from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
 import config
 import platforms
@@ -504,6 +508,10 @@ def finish_manual_login(platform_key):
 _DPAGES = {}  # platform_key -> ChromiumPage（登录后保持打开，检索复用）
 _LAST_SEARCH_ERROR = {}  # platform_key -> 最近一次检索失败的真实原因（供界面显示）
 _HIDDEN_LAUNCH = set()  # 以“屏幕外窗口”启动的平台（检索静默用）
+_RUN_SEQ = itertools.count(1)  # 诊断 run_id 序号（不消耗随机源，保证测试可预期）
+_SEARCH_LOCKS = {}       # platform_key -> threading.Lock（同平台检索互斥）
+_LAST_SEARCH_DIAG = {}   # platform_key -> 最近一次诊断快照（含事件列表）
+SEARCH_RNG = random.Random()  # 滚动间隔抽样源：测试可替换为固定序列对象
 
 
 def is_active(platform_key):
@@ -532,6 +540,67 @@ def can_search(platform_key):
 def last_search_error(platform_key):
     """最近一次检索失败的原因（无失败返回空串）。"""
     return _LAST_SEARCH_ERROR.get(platform_key, "")
+
+
+def last_search_diagnostic(platform_key):
+    """最近一次检索的诊断快照（含事件列表）；无记录返回空 dict。"""
+    diag = _LAST_SEARCH_DIAG.get(platform_key)
+    return dict(diag) if diag else {}
+
+
+def surface_verification_page(platform_key, page=None, left=120, top=80):
+    """把命中安全验证的浏览器窗口显示到桌面，交给用户人工完成验证。
+
+    返回 (ok, message)：ok=False 时给出可读原因（例如浏览器已关闭）。
+    """
+    page = page or _DPAGES.get(platform_key)
+    if page is None:
+        page = _attach_existing(platform_key)  # 浏览器可能还在跑，只是进程内引用丢了
+        if page is not None:
+            _DPAGES[platform_key] = page
+    if page is None:
+        return False, "没有可用的浏览器窗口：请到「平台登录」页签打开该平台浏览器"
+    shown = False
+    try:
+        shown = bool(_set_browser_visible(page, True))
+    except Exception:
+        shown = False
+    _HIDDEN_LAUNCH.discard(platform_key)
+    moved = False
+    try:
+        moved = bool(_show_page_window(page, left=left, top=top))
+    except Exception:
+        moved = False
+    if not (shown or moved):
+        return False, ("浏览器窗口无法自动显示：请到「平台登录」页签点"
+                       "「在浏览器窗口中打开」，或手动切到该窗口完成验证")
+    return True, "验证页面已显示到桌面"
+
+
+def verification_pending(platform_key, page=None):
+    """当前是否仍处于安全验证/频控拦截状态。"""
+    page = page or _DPAGES.get(platform_key)
+    if page is None:
+        return False
+    try:
+        return _detect_page_state(page, platform_key) is not None
+    except Exception:
+        return False
+
+
+def wait_verification_done(platform_key, timeout=None, interval=2.0, page=None):
+    """等待用户手工完成验证。返回 (done, detail)；done=True 表示已离开验证状态。"""
+    page = page or _DPAGES.get(platform_key)
+    if page is None:
+        return False, "浏览器窗口已关闭"
+    if timeout is None:
+        timeout = getattr(config, "VERIFY_WAIT_TIMEOUT", 180)
+    deadline = time.time() + max(1.0, float(timeout))
+    while time.time() < deadline:
+        if not verification_pending(platform_key, page=page):
+            return True, "已离开安全验证页面"
+        _sleep(max(0.5, float(interval)))
+    return False, "等待超时（%d 秒）" % int(timeout)
 
 
 def _port_file(platform_key):
@@ -869,6 +938,26 @@ def dpage_finish(platform_key):
 # 浏览器在屏幕外隐藏运行（非无头，保留指纹），二维码截图实时回传到 Web 界面，
 # 用户不需要离开页面、也不会弹出浏览器窗口。
 
+def _clear_platform_cookies(page):
+    """清掉浏览器 cookie。
+
+    实测：驻留 profile 里残留的匿名 cookie（zp_at/__zp_stoken__ 等）会让
+    /web/user 登录页在 1 秒内被前端路由弹回首页，导致二维码永远截不到。
+    """
+    try:
+        page.run_cdp("Network.clearBrowserCookies")
+        return True
+    except Exception:
+        return False
+
+
+def _on_login_path(url, want_path):
+    try:
+        return bool(want_path) and urlsplit(str(url or "")).path.startswith(want_path)
+    except Exception:
+        return False
+
+
 def qr_login_start(platform_key):
     """在隐藏浏览器里打开登录页并截取首张二维码。返回 (ok, msg)。"""
     p = platforms.get(platform_key)
@@ -878,14 +967,31 @@ def qr_login_start(platform_key):
         page = _get_page(platform_key, hidden=True)
     except RuntimeError as exc:
         return False, str(exc)
-    try:
-        page.get(p["login_url"])  # 每次开始都刷新，保证拿到的是有效新码
-        page.wait(2)
-    except Exception as exc:
-        return False, "无法打开登录页：%s" % exc
+    login_url = p["login_url"]
+    want_path = urlsplit(login_url).path or ""
+    current = ""
+    for attempt in (1, 2):
+        try:
+            page.get(login_url)  # 每次开始都刷新，保证拿到的是有效新码
+            page.wait(2)
+        except Exception as exc:
+            return False, "无法打开登录页：%s" % exc
+        try:
+            current = page.url or ""
+        except Exception:
+            current = ""
+        if _on_login_path(current, want_path):
+            break
+        if attempt == 1:
+            # 被弹离登录页：先清 cookie 再试一次（残留 cookie 是已知原因）
+            _clear_platform_cookies(page)
+            continue
+        return False, ("登录页被重定向到 %s，无法截取二维码。请点「在浏览器窗口中打开」，"
+                       "在浏览器里人工登录后再检索（也可点「退出该平台登录」后重试）"
+                       % (current or "未知地址"))
     ok, payload = qr_login_shot(platform_key)
     if not ok:
-        return True, "已打开登录页，二维码加载中（%s）" % payload
+        return False, payload
     return True, "二维码已就绪"
 
 
@@ -978,20 +1084,32 @@ def qr_login_shot(platform_key, reload=False):
         except Exception:
             saved = False
         if not saved:
+            ele = None
             try:
                 ele = page.ele(qr_sel, timeout=3)
                 if not ele and attempt == 0:
                     _switch_tab()  # 首次没找到再切一次页签兜底
                     ele = page.ele(qr_sel, timeout=3)
-                if ele:
-                    ele.get_screenshot(path=str(SESSION_DIR), name=name)
-                else:
-                    page.get_screenshot(path=str(SESSION_DIR), name=name)  # 兜底整页
             except Exception:
+                ele = None
+            if not ele:
+                # 关键：找不到二维码元素时绝不拿整页截图冒充成功
+                # （首页/验证页也被判成“已登录”，曾导致未扫码就报登录成功）
                 try:
-                    page.get_screenshot(path=str(SESSION_DIR), name=name)
-                except Exception as exc:
-                    return False, "截图失败：%s" % exc
+                    page.get_screenshot(path=str(SESSION_DIR),
+                                        name="%s_qr_debug.png" % platform_key)
+                except Exception:
+                    pass
+                try:
+                    current = page.url
+                except Exception:
+                    current = ""
+                return False, ("未找到二维码元素 %s（当前页面 %s）：页面可能未进入登录页，"
+                               "或平台改版" % (qr_sel, current or "未知地址"))
+            try:
+                ele.get_screenshot(path=str(SESSION_DIR), name=name)
+            except Exception as exc:
+                return False, "二维码截图失败：%s" % exc
         # 截图后复查遮罩：无效则刷新重取，最多 3 轮
         if not _invalid_visible():
             return True, str(shot)
@@ -1033,10 +1151,256 @@ def qr_login_demo_scan(platform_key):
         return False, "模拟扫码失败：%s" % exc
 
 
-def dpage_search(platform_key, keyword, city="", pages=1):
-    """正确做法：用 DrissionPage 旁听浏览器自己发的搜索接口响应，拿明文岗位数据。
+# ---------- 检索诊断：脱敏 URL / 页面状态判定 / 结构化事件 ----------
+def _search_lock(platform_key):
+    lock = _SEARCH_LOCKS.get(platform_key)
+    if lock is None:
+        lock = threading.Lock()
+        _SEARCH_LOCKS[platform_key] = lock
+    return lock
+
+
+def _now_text():
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _sleep(seconds):
+    """统一等待入口：测试可替换为假时钟，避免真实等待。"""
+    time.sleep(max(0.0, float(seconds)))
+
+
+def _sample_scroll_interval():
+    """每轮独立抽样一次滚动间隔；配置非法时抛 ValueError（不静默降级）。"""
+    lo, hi = config.search_scroll_bounds()
+    return float(SEARCH_RNG.uniform(lo, hi))
+
+
+def _redact_url(url):
+    """URL 脱敏：保留协议/主机/路径与白名单参数值，其余参数值遮蔽，丢弃 fragment 与凭据。"""
+    text = str(url or "").strip()
+    if not text:
+        return ""
+    try:
+        parts = urlsplit(text)
+    except Exception:
+        return "[URL 无法解析]"
+    if not parts.scheme or not parts.netloc:
+        return text.split("#", 1)[0][:200]
+    netloc = parts.netloc.rsplit("@", 1)[-1]  # 去掉 user:pass@
+    keep = platforms.SEARCH_URL_KEEP_QUERY_PARAMS
+    pairs = []
+    for key, value in parse_qsl(parts.query, keep_blank_values=True):
+        if key in keep:
+            shown = value if len(value) <= 120 else value[:120] + "…"
+            pairs.append((key, shown))
+        else:
+            pairs.append((key, "[REDACTED]"))
+    query = "&".join("%s=%s" % (k, v) for k, v in pairs)
+    return urlunsplit((parts.scheme, netloc, parts.path, query, ""))
+
+
+def _security_path_hit(url):
+    """URL 路径段是否命中安全验证规则（不做整串 URL 子串匹配，避免误报）。"""
+    try:
+        path = urlsplit(str(url or "")).path or ""
+    except Exception:
+        return ""
+    segments = platforms.SEARCH_SECURITY_PATH_SEGMENTS
+    for raw in path.split("/"):
+        seg = raw.strip().lower()
+        if seg.endswith(".html"):
+            seg = seg[:-5]
+        if seg and seg in segments:
+            return seg
+    return ""
+
+
+def _detect_hint(text, hints):
+    low = str(text or "").lower()
+    for hint in hints:
+        if hint.lower() in low:
+            return hint
+    return ""
+
+
+def _visible_text(page, limit=4000):
+    """取页面“可见文本”（不含 script/style 模板），失败返回空串。"""
+    try:
+        body = page.ele("tag:body")
+        text = body.text if body is not None else ""
+    except Exception:
+        return ""
+    return str(text or "")[:limit]
+
+
+def _job_card_count(page, platform_cfg):
+    """当前页岗位卡片数：用于给“可见文本命中提示词”降权，避免岗位标题误报。"""
+    selector = (platform_cfg or {}).get("item_selector")
+    if not selector:
+        return 0
+    try:
+        return len(page.eles(selector) or [])
+    except Exception:
+        return 0
+
+
+def _detect_page_state(page, platform_key):
+    """判定当前页面是否被安全验证/频控拦截。返回 dict 或 None；弱线索只记录不判定。"""
+    cfg = platforms.get(platform_key) or {}
+    try:
+        url = page.url or ""
+    except Exception:
+        url = ""
+    segment = _security_path_hit(url)
+    if segment:
+        return {"kind": "blocked_verification", "evidence_source": "url",
+                "matched_rule": "url-path:%s" % segment, "url": url}
+    try:
+        title = page.title or ""
+    except Exception:
+        title = ""
+    hit = _detect_hint(title, platforms.SEARCH_SECURITY_STRONG_HINTS)
+    if hit:
+        return {"kind": "blocked_verification", "evidence_source": "title",
+                "matched_rule": "title:%s" % hit, "url": url}
+    hit = _detect_hint(title, platforms.SEARCH_RATE_LIMIT_HINTS)
+    if hit:
+        return {"kind": "rate_limited", "evidence_source": "title",
+                "matched_rule": "title:%s" % hit, "url": url}
+    text = _visible_text(page)
+    if not text:
+        return None
+    has_cards = _job_card_count(page, cfg) > 0
+    hit = _detect_hint(text, platforms.SEARCH_SECURITY_STRONG_HINTS)
+    if hit and not has_cards:
+        return {"kind": "blocked_verification", "evidence_source": "visible-text",
+                "matched_rule": "visible-text:%s" % hit, "url": url}
+    hit = _detect_hint(text, platforms.SEARCH_RATE_LIMIT_HINTS)
+    if hit and not has_cards:
+        return {"kind": "rate_limited", "evidence_source": "visible-text",
+                "matched_rule": "visible-text:%s" % hit, "url": url}
+    return None
+
+
+def _api_code_message(body):
+    """从接口响应中取 (code, message)；非 dict 或无 code 时返回 (None, "")。"""
+    if not isinstance(body, dict):
+        return None, ""
+    code = body.get("code")
+    if code is None:
+        return None, ""
+    return code, str(body.get("message") or body.get("msg") or "")
+
+
+def _new_diag(platform_key, keyword, city, pages, prefer_dom):
+    """初始化本次检索的诊断快照（每次调用独立，绝不沿用上次失败信息）。"""
+    return {
+        "run_id": "%s-%s-%d" % (platform_key, time.strftime("%H%M%S"), next(_RUN_SEQ)),
+        "platform": platform_key,
+        "keyword": keyword,
+        "city": city,
+        "pages": int(pages),
+        "prefer_dom": bool(prefer_dom),
+        "requested_url": "",
+        "current_url": "",
+        "last_observed_url": "",
+        "url_read_error": "",
+        "evidence_source": "",
+        "matched_rule": "",
+        "packet_count": 0,
+        "raw_job_count": 0,
+        "filtered_contact_count": 0,
+        "duplicate_count": 0,
+        "result_count": 0,
+        "api_code": None,
+        "api_message": "",
+        "partial": False,
+        "surfaced": False,
+        "kind": "",
+        "message": "",
+        "stage": "发起检索",
+        "scroll_intervals": [],
+        "started_at": _now_text(),
+        "finished_at": "",
+        "events": [],
+    }
+
+
+def _emit(diag, on_event, kind="", message="", stage="", **fields):
+    """记录并派发一条诊断事件；回调异常不得中断抓取。"""
+    for key, value in fields.items():
+        if key in diag:
+            diag[key] = value
+    if kind:
+        diag["kind"] = kind
+    if message:
+        diag["message"] = message
+    if stage:
+        diag["stage"] = stage
+    event = {k: v for k, v in diag.items() if k != "events"}
+    event["event_id"] = len(diag["events"]) + 1
+    event["time"] = _now_text()
+    diag["events"].append(event)
+    if on_event is not None:
+        try:
+            on_event(event)
+        except Exception:
+            pass
+    return event
+
+
+def _finalize_search(platform_key, diag, on_event, jobs, page, debug):
+    """统一收尾：补读终态 URL、停监听、写诊断与调试文件、派发汇总事件。"""
+    diag["result_count"] = len(jobs)
+    diag["finished_at"] = _now_text()
+    if page is not None:
+        try:
+            current = page.url
+            diag["current_url"] = _redact_url(current)
+            if diag["current_url"]:
+                diag["last_observed_url"] = diag["current_url"]
+            diag["url_read_error"] = ""
+        except Exception as exc:
+            diag["url_read_error"] = str(exc)[:200] or "读取失败"
+        try:
+            page.listen.stop()
+        except Exception:
+            pass
+    lines = list(debug)
+    lines.append("阶段: %s" % (diag.get("stage") or "-"))
+    lines.append("判定: %s / %s" % (diag.get("kind") or "-", diag.get("message") or "-"))
+    lines.append("依据: %s（来源 %s）" % (diag.get("matched_rule") or "-",
+                                       diag.get("evidence_source") or "-"))
+    lines.append("请求页面: %s" % (diag.get("requested_url") or "-"))
+    lines.append("当前页面: %s" % (diag.get("current_url") or
+                                 "无法获取（%s）" % (diag.get("url_read_error") or "-")))
+    lines.append("最后观测: %s" % (diag.get("last_observed_url") or "-"))
+    lines.append("计数: 包=%d 原始=%d 过滤已沟通=%d 去重=%d 结果=%d"
+                 % (diag.get("packet_count", 0), diag.get("raw_job_count", 0),
+                    diag.get("filtered_contact_count", 0), diag.get("duplicate_count", 0),
+                    diag.get("result_count", 0)))
+    lines.append("接口: code=%s message=%s" % (diag.get("api_code"),
+                                              (diag.get("api_message") or "")[:120]))
+    if diag.get("scroll_intervals"):
+        lines.append("滚动间隔: %s" % ", ".join(str(x) for x in diag["scroll_intervals"]))
+    _write_debug(platform_key, lines)
+    _LAST_SEARCH_DIAG[platform_key] = diag
+    if jobs and not diag.get("partial"):
+        _LAST_SEARCH_ERROR.pop(platform_key, None)
+    else:
+        _LAST_SEARCH_ERROR[platform_key] = diag.get("message") or "未获取到岗位"
+    _emit(diag, on_event)
+    return diag
+
+
+def dpage_search(platform_key, keyword, city="", pages=1, on_event=None):
+    """用 DrissionPage 旁听浏览器自己发的搜索接口响应，拿明文岗位数据。
 
     不自己发请求（规避 code:37 反爬），不用 DOM 提取（规避字体反爬）。
+
+    诊断：0 个岗位时给出“判定依据 + 脱敏 URL + 阶段计数”，并可通过 on_event 实时回传
+    （回调收到的是一条结构化 event dict）。命中安全验证/频控立即停止本轮滚动，
+    不重试、不切换通道、不清登录态；已抓到的岗位按 partial 保留。
     """
     import json as _json
     from crawler import normalize_fields, _dig
@@ -1046,84 +1410,214 @@ def dpage_search(platform_key, keyword, city="", pages=1):
         return []
     # 猎聘/51job 是前端渲染，接口里也拿不到明文岗位：直接用浏览器渲染后的 DOM 解析
     prefer_dom = bool(p.get("dom_parse")) or not p.get("api_field_map")
-    # 城市名 -> 平台城市码
+    # 城市名 -> 平台城市码（search_url 内部使用）
     search_city = platforms.city_code(platform_key, city) if city else \
         (platforms.city_code(platform_key, "北京") if platform_key == "boss" else "")
-    _LAST_SEARCH_ERROR.pop(platform_key, None)
-    try:
-        # 检索默认不弹窗：能复用登录浏览器就复用，需新开则放到屏幕外
-        page = _get_page(platform_key, hidden=config.SEARCH_HIDDEN)
-    except RuntimeError as exc:
-        _LAST_SEARCH_ERROR[platform_key] = str(exc)
-        _write_debug(platform_key, ["浏览器启动失败: %s" % exc])
-        return []
-    # 检索期间把浏览器窗口藏起来：即使复用的是当前可见的登录窗口，也不会「弹」在用户面前
-    if config.SEARCH_HIDDEN and not config.HEADLESS:
-        if _set_browser_visible(page, False):
-            _HIDDEN_LAUNCH.add(platform_key)
-
-    jobs = []
+    diag = _new_diag(platform_key, keyword, city, pages, prefer_dom)
+    diag["requested_url"] = _redact_url(platforms.search_url(platform_key, keyword, city, 1))
     debug = []
-    reason = ""
+    jobs = []
+    page = None
+
+    # 配置校验必须最先做：非法间隔要明确报错，不能静默变成高速循环
     try:
+        config.search_scroll_bounds()
+    except ValueError as exc:
+        diag["kind"] = "search_error"
+        diag["stage"] = "配置校验"
+        diag["message"] = "滚动间隔配置错误：%s" % exc
+        _LAST_SEARCH_DIAG[platform_key] = diag
+        _LAST_SEARCH_ERROR[platform_key] = diag["message"]
+        _emit(diag, on_event)
+        return []
+
+    # 同平台互斥：复用的浏览器与监听器不能被两个线程同时操作
+    lock = _search_lock(platform_key)
+    if not lock.acquire(blocking=False):
+        diag["kind"] = "search_error"
+        diag["message"] = "该平台正在检索中，已拒绝本次重复发起"
+        _LAST_SEARCH_DIAG[platform_key] = diag
+        _LAST_SEARCH_ERROR[platform_key] = diag["message"]
+        _emit(diag, on_event)
+        return []
+
+    stage = "启动浏览器"
+    stop_state = None
+    try:
+        try:
+            # 检索默认不弹窗：能复用登录浏览器就复用，需新开则放到屏幕外
+            page = _get_page(platform_key, hidden=config.SEARCH_HIDDEN)
+        except RuntimeError as exc:
+            diag["kind"] = "browser_unavailable"
+            diag["message"] = str(exc)
+            debug.append("浏览器启动失败: %s" % exc)
+            return []
+        # 检索期间把浏览器窗口藏起来：即使复用的是当前可见的登录窗口，也不会弹到用户面前
+        if config.SEARCH_HIDDEN and not config.HEADLESS:
+            try:
+                if _set_browser_visible(page, False):
+                    _HIDDEN_LAUNCH.add(platform_key)
+            except Exception:
+                pass
+
+        stage = "启动监听"
         api_kw = p.get("api_listen_kw", "joblist.json")
         try:
             page.listen.start(api_kw)
         except Exception as exc:
             if "浏览器未开启或已关闭" not in str(exc):
-                raise
-            # 浏览器已被关闭（或应用重启后残留失效引用）：丢弃引用、接管/重启浏览器后重试一次
+                diag["kind"] = "search_error"
+                diag["message"] = "网络监听启动失败：%s" % exc
+                debug.append(diag["message"])
+                return []
+            # 浏览器已被关闭（或应用重启后残留失效引用）：丢弃引用、接管/重启后重试一次
             _DPAGES.pop(platform_key, None)
             debug.append("浏览器已关闭，尝试重启后重试")
             page = _get_page(platform_key, hidden=config.SEARCH_HIDDEN)
             page.listen.start(api_kw)
+
+        stage = "导航"
         url = platforms.search_url(platform_key, keyword, city, 1)
         page.get(url)
         page.wait(3)
-        debug.append("URL: %s" % page.url[:120])
-        # 登录态失效检测：导航后被重定向到登录页（用平台 login_check 配置判断，不再硬编码 Boss 路径）
-        _cfg = p.get("login_check", {})
-        _expired = False
-        if _cfg.get("type") == "url_not_contains":
-            _expired = _cfg["value"] in page.url
-        if _expired:
-            clear_session(platform_key)
-            reason = "登录态已失效（被重定向到登录页），请到「平台登录」页签重新扫码登录"
-            debug.append("登录态失效，已重定向到登录页")
-            return []
-        # 滚动触发无限滚动翻页（Boss直聘靠滚动加载更多）
-        for i in range(max(1, int(pages))):
+        try:
+            diag["last_observed_url"] = _redact_url(page.url)
+        except Exception as exc:
+            diag["url_read_error"] = str(exc)[:200]
+        debug.append("请求页面: %s" % _redact_url(url))
+
+        # 导航后先判验证/频控，再判普通登录跳转（避免把验证页误判为掉线）
+        stop_state = _detect_page_state(page, platform_key)
+        if stop_state:
+            diag["kind"] = stop_state["kind"]
+            diag["evidence_source"] = stop_state["evidence_source"]
+            diag["matched_rule"] = stop_state["matched_rule"]
+            diag["current_url"] = _redact_url(stop_state.get("url"))
+            debug.append("导航后命中 %s" % stop_state["matched_rule"])
+        else:
+            login_cfg = p.get("login_check", {})
+            try:
+                current_for_login = page.url or ""
+            except Exception as exc:
+                # 读不到当前 URL：不能据此判登录失效，也不得盖掉更明确的原因
+                current_for_login = ""
+                diag["url_read_error"] = str(exc)[:200] or "读取失败"
+                debug.append("读取当前 URL 失败: %s" % exc)
+            expired = bool(login_cfg.get("type") == "url_not_contains" and
+                           login_cfg.get("value") and login_cfg["value"] in current_for_login)
+            if expired:
+                clear_session(platform_key)
+                diag["kind"] = "login_expired"
+                diag["evidence_source"] = "url"
+                diag["matched_rule"] = "url-contains:%s" % login_cfg["value"]
+                diag["message"] = ("登录态已失效（被重定向到登录页），"
+                                   "请到「平台登录」页签重新扫码登录")
+                debug.append("登录态失效，已重定向到登录页")
+                return []
+
+        # 滚动触发无限滚动翻页（Boss 靠滚动加载更多）；每轮独立抽样等待时长
+        total_scrolls = max(1, int(pages))
+        for index in range(total_scrolls):
+            if stop_state:
+                break
+            stage = "滚动前(#%d)" % (index + 1)
+            try:
+                interval = _sample_scroll_interval()
+            except ValueError as exc:
+                diag["kind"] = "search_error"
+                diag["message"] = "滚动间隔配置错误：%s" % exc
+                return jobs
+            diag["scroll_intervals"].append(round(interval, 2))
+            debug.append("滚动 #%d：等待 %.2fs（%s 开始）" % (index + 1, interval, _now_text()))
+            _sleep(interval)
+
+            stop_state = _detect_page_state(page, platform_key)
+            if stop_state:
+                debug.append("滚动前命中 %s" % stop_state["matched_rule"])
+                break
             try:
                 page.run_js("window.scrollTo(0, document.body.scrollHeight);")
-                page.wait(1)
-            except Exception:
+            except Exception as exc:
+                debug.append("滚动执行失败: %s" % exc)
                 break
+            try:
+                page.wait(config.SEARCH_SCROLL_OBSERVE_WAIT)
+            except Exception:
+                pass
+            stage = "滚动后(#%d)" % (index + 1)
+            stop_state = _detect_page_state(page, platform_key)
+            if stop_state:
+                debug.append("滚动后命中 %s" % stop_state["matched_rule"])
+                break
+
+        if stop_state:
+            diag["kind"] = stop_state["kind"]
+            diag["evidence_source"] = stop_state["evidence_source"]
+            diag["matched_rule"] = stop_state["matched_rule"]
+            if _redact_url(stop_state.get("url")):
+                diag["current_url"] = _redact_url(stop_state.get("url"))
+            if diag["kind"] == "blocked_verification":
+                diag["message"] = "检测到疑似安全验证页面，已停止本轮抓取"
+                if config.SURFACE_ON_VERIFICATION:
+                    surfaced, detail = surface_verification_page(platform_key, page=page)
+                    diag["surfaced"] = bool(surfaced)
+                    debug.append("验证页展示: %s" % ("成功" if surfaced else detail))
+                    diag["message"] += ("；验证页面已显示到桌面，请人工完成验证后重新检索"
+                                        if surfaced else "；%s" % detail)
+            else:
+                diag["message"] = "检测到频率限制提示，已停止本轮抓取"
+            debug.append("命中后停止滚动: %s" % diag["matched_rule"])
+
         if prefer_dom:
+            stage = "解析页面"
             from crawler import jobs_from_zhilian_state, parse_job_cards
-            jobs = []
             if platform_key == "zhilian":
                 try:
                     state = page.run_js("return window.__INITIAL_STATE__ || null;")
                 except Exception:
                     state = None
-                jobs = jobs_from_zhilian_state(state)
+                jobs = jobs_from_zhilian_state(state) or []
                 debug.append("页面状态解析岗位数: %d" % len(jobs))
             if not jobs:
-                jobs = parse_job_cards(page.html, platform_key, page.url)
+                try:
+                    html = page.html
+                except Exception as exc:
+                    html = ""
+                    debug.append("读取页面 HTML 失败: %s" % exc)
+                try:
+                    base_url = page.url
+                except Exception:
+                    base_url = ""
+                jobs = parse_job_cards(html, platform_key, base_url) or []
                 debug.append("DOM 解析岗位数: %d" % len(jobs))
-            if not jobs:
-                reason = ("页面未解析到岗位：可能被验证码/登录墙拦截，"
-                          "或平台页面结构已变化")
+            diag["raw_job_count"] = len(jobs)
+            if not jobs and not stop_state:
+                diag["kind"] = "parse_empty"
+                diag["message"] = ("页面未解析到岗位：可能被登录墙拦截，"
+                                   "或平台页面结构已变化")
             return jobs
-        # 收集 joblist 接口响应（每页一个包；count==1 时 wait 返回单个 DataPacket，归一为列表）
+
+        stage = "收包"
         want = max(1, int(pages))
-        packets = page.listen.wait(count=want, timeout=5 + want * 3, fit_count=False)
+        timeout = 3 if stop_state else 5 + want * 3
+        packets = page.listen.wait(count=want, timeout=timeout, fit_count=False)
         if packets is False or packets is None:
             packets = []
         elif not isinstance(packets, (list, tuple)):
             packets = [packets]  # 单个 DataPacket 也归一为列表
-        debug.append("捕获接口响应数: %d" % len(packets))
+        diag["packet_count"] = len(packets)
+        debug.append("捕获接口响应数: %d（超时 %ds）" % (len(packets), timeout))
+
+        stage = "解析接口"
         seen = set()
+        found_list = 0
+        found_empty = False
+        api_success = platforms.search_api_success_code(platform_key)
+        _link_rules = {
+            "boss": "https://www.zhipin.com/job_detail/%s.html",
+            "lagou": "https://www.lagou.com/jobs/%s.html",
+            "job51": "https://jobs.51job.com/all/%s.html",
+        }
         for packet in packets:
             try:
                 body = packet.response.body
@@ -1134,51 +1628,96 @@ def dpage_search(platform_key, keyword, city="", pages=1):
                     body = _json.loads(body)
                 except Exception:
                     continue
+            code, api_message = _api_code_message(body)
+            if code is not None and str(code) != str(api_success):
+                diag["api_code"] = code
+                diag["api_message"] = api_message
             job_list = _dig(body, p.get("api_jobs_path", "zpData.jobList"))
             if not isinstance(job_list, list):
                 continue
+            found_list += 1
+            if not job_list:
+                found_empty = True
+                continue
+            diag["raw_job_count"] += len(job_list)
             for item in job_list:
                 if str(item.get("contact", "")).lower() in ("true", "1"):
+                    diag["filtered_contact_count"] += 1
                     continue
                 raw = {}
                 for std, src in p.get("api_field_map", {}).items():
                     raw[std] = _dig(item, src)
                 link = raw.get("岗位链接", "")
                 raw["岗位链接"] = platforms.job_url(platform_key, link)
-                if link and not str(link).startswith("http"):
-                    # 按平台拼岗位详情链接（各平台 jobId -> 详情页规则不同）
-                    _link_rules = {
-                        "boss": "https://www.zhipin.com/job_detail/%s.html",
-                        "lagou": "https://www.lagou.com/jobs/%s.html",
-                        "job51": "https://jobs.51job.com/all/%s.html",
-                    }
-                    if platform_key in _link_rules:
-                        raw["岗位链接"] = _link_rules[platform_key] % link
+                if link and not str(link).startswith("http") and platform_key in _link_rules:
+                    raw["岗位链接"] = _link_rules[platform_key] % link
                 raw.setdefault("投递入口类型", "")
                 norm = normalize_fields(raw)
                 key = norm.get("岗位链接") or norm.get("岗位名称")
                 if key and key in seen:
+                    diag["duplicate_count"] += 1
                     continue
                 seen.add(key)
                 jobs.append(norm)
-        debug.append("去重后岗位数: %d" % len(jobs))
-        if not jobs and not reason:
-            reason = ("未捕获到搜索接口响应：页面可能被风控/验证码拦截，"
-                      "或搜索页未加载完成，请重试")
-    except Exception as e:
-        debug.append("检索异常: %s" % e)
-        reason = "检索异常：%s" % e
+        diag["result_count"] = len(jobs)
+        debug.append("原始 %d / 过滤已沟通 %d / 去重 %d / 结果 %d"
+                     % (diag["raw_job_count"], diag["filtered_contact_count"],
+                        diag["duplicate_count"], len(jobs)))
+
+        if jobs:
+            if stop_state:
+                diag["partial"] = True
+                diag["message"] = ("已获取 %d 条，后续抓取因安全验证停止" % len(jobs)
+                                   if diag["kind"] == "blocked_verification"
+                                   else "已获取 %d 条，后续抓取因频率限制停止" % len(jobs))
+            return jobs
+        if stop_state:
+            return []  # 原因已在命中时写入
+        if diag["api_code"] is not None:
+            diag["kind"] = "api_error"
+            diag["message"] = "接口返回失败（code=%s）%s" % (
+                diag["api_code"], (diag["api_message"] or "")[:80])
+        elif diag["raw_job_count"] > 0:
+            diag["kind"] = "filtered_empty"
+            diag["message"] = "已收到 %d 条岗位，过滤已沟通/重复后为 0" % diag["raw_job_count"]
+        elif found_empty:
+            diag["kind"] = "empty_result"
+            diag["message"] = "当前条件下没有匹配岗位（接口正常返回空列表）"
+        elif diag["packet_count"] == 0:
+            diag["kind"] = "no_packet"
+            weak = _detect_hint(_visible_text(page), platforms.SEARCH_WEAK_HINTS)
+            diag["message"] = ("未收到岗位接口响应，原因暂不确定"
+                               + ("（页面提示：%s）" % weak if weak else ""))
+        elif found_list:
+            diag["kind"] = "parse_empty"
+            diag["message"] = "已收到响应但岗位列表为空且结构不符，可能平台改版"
+        else:
+            diag["kind"] = "parse_empty"
+            diag["message"] = "已收到响应但未找到岗位列表字段，可能平台改版或结构变化"
+        return jobs
+    except Exception as exc:
+        debug.append("检索异常: %s" % exc)
+        diag["kind"] = diag["kind"] or "search_error"
+        diag["message"] = diag["message"] or ("检索异常：%s" % exc)
+        return jobs
     finally:
         try:
-            page.listen.stop()  # 释放网络监听（浏览器保持打开，供下次复用）
+            if not diag.get("kind"):
+                diag["kind"] = "ok" if jobs else "no_packet"
+            base = diag.get("message") or ""
+            if not base.startswith("抓取到"):
+                if jobs:
+                    diag["message"] = ("抓取到 %d 个岗位" % len(jobs)
+                                       + ("；" + base if base else ""))
+                else:
+                    diag["message"] = "抓取到 0 个岗位：%s" % (base or "原因暂不确定")
+            diag["stage"] = stage
+            _finalize_search(platform_key, diag, on_event, jobs, page, debug)
         except Exception:
+            # 收尾自身出错不得掩盖原始原因，也不能让调用方拿到异常
             pass
-        _write_debug(platform_key, debug)
-        if jobs:
-            _LAST_SEARCH_ERROR.pop(platform_key, None)
-        else:
-            _LAST_SEARCH_ERROR[platform_key] = reason or (debug[-1] if debug else "未获取到岗位")
-        # 不 quit：保持浏览器打开（登录态/会话 cookie 依赖浏览器驻留），供下次检索与扫码复用
+        finally:
+            lock.release()
     return jobs
 
 
