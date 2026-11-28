@@ -27,6 +27,42 @@ AUTO_CHECK_PLATFORMS = [x.strip() for x in
 # 设为 0/false 可恢复为“检索也弹窗”。
 SEARCH_HIDDEN = os.environ.get("JOBDELIVERY_SEARCH_HIDDEN", "1").lower() not in ("0", "false", "no")
 
+# ---------- 检索滚动间隔（动作节奏）----------
+# 抓取期间每次滚动前重新抽取一次等待时长，避免固定间隔这种典型自动化特征。
+# 只控制动作节奏，不承诺规避平台风控；命中安全验证时应停止本轮抓取。
+SEARCH_SCROLL_INTERVAL_MIN = os.environ.get("JOBDELIVERY_SEARCH_SCROLL_MIN", "2.0")
+SEARCH_SCROLL_INTERVAL_MAX = os.environ.get("JOBDELIVERY_SEARCH_SCROLL_MAX", "5.0")
+# 滚动后等待数据到达的观察时间（秒）。它负责“数据是否到了”，不参与节奏控制。
+SEARCH_SCROLL_OBSERVE_WAIT = float(os.environ.get("JOBDELIVERY_SEARCH_OBSERVE_WAIT", "1.0"))
+
+
+# 命中安全验证时，自动把该平台的浏览器窗口显示到桌面，交给用户人工完成验证。
+SURFACE_ON_VERIFICATION = os.environ.get("JOBDELIVERY_SURFACE_VERIFY", "1").lower() \
+    not in ("0", "false", "no")
+# 等待用户手工完成验证的最长秒数（GUI 提示 / 显式等待时使用）
+VERIFY_WAIT_TIMEOUT = float(os.environ.get("JOBDELIVERY_VERIFY_WAIT", "180"))
+
+
+def search_scroll_bounds():
+    """返回 (min, max) 滚动间隔；配置非法时抛 ValueError（明确报错，不静默降级）。"""
+    values = []
+    for name, raw in (("SEARCH_SCROLL_INTERVAL_MIN", SEARCH_SCROLL_INTERVAL_MIN),
+                      ("SEARCH_SCROLL_INTERVAL_MAX", SEARCH_SCROLL_INTERVAL_MAX)):
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            raise ValueError("%s 必须是数字，当前为 %r" % (name, raw))
+        if value != value or value in (float("inf"), float("-inf")):
+            raise ValueError("%s 必须是有限数字，当前为 %r" % (name, raw))
+        values.append(value)
+    lo, hi = values
+    if lo <= 0:
+        raise ValueError("SEARCH_SCROLL_INTERVAL_MIN 必须大于 0，当前为 %r" % lo)
+    if hi < lo:
+        raise ValueError("SEARCH_SCROLL_INTERVAL_MAX(%r) 必须不小于 MIN(%r)" % (hi, lo))
+    return lo, hi
+
+
 # ---------- 登录态检测 ----------
 # 应用启动 / 页面刷新时自动检测各平台登录情况；联网探测只针对已有登录态的平台，
 # 每次刷新最多一次请求/平台。设为 0 则只做本地检测（离线、零网络）。

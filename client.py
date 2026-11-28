@@ -300,6 +300,12 @@ class App(tk.Tk):
                                            "打开登录页失败：%s\n\n如提示依赖缺失，请安装 requirements-browser.txt" % err)
                 self.after(0, fail)
                 return
+            if not ok:
+                def fail_msg(text=msg):
+                    log("[%s] %s" % (key, text))
+                    messagebox.showwarning("平台登录", text)
+                self.after(0, fail_msg)
+                return
             self.after(0, lambda: (log("[%s] %s" % (key, msg)), self._qr_open(key)))
         self._run(work)
 
@@ -324,14 +330,16 @@ class App(tk.Tk):
             except Exception:
                 return False
 
-        state = {"tick": 0, "done": False}
+        state = {"tick": 0, "done": False, "qr_ok": False}
 
         def _poll():
             if state["done"] or not win.winfo_exists():
                 return
             state["tick"] += 1
             try:
-                if session.qr_login_status(key):
+                # 只有真的拿到过二维码，才允许用“登录态判定”收尾；
+                # 否则页面被路由走时会被误判成“已扫码”
+                if state["qr_ok"] and session.qr_login_status(key):
                     state["done"] = True
                     lbl_tip.config(text="已扫码，正在保存登录态...", foreground="#0a6")
                     def _finish():
@@ -348,6 +356,7 @@ class App(tk.Tk):
                 if state["tick"] % 15 == 0:
                     ok, payload = session.qr_login_shot(key, reload=(state["tick"] % 60 == 0))
                     if ok:
+                        state["qr_ok"] = True
                         _load_img(payload)
                     else:
                         lbl_tip.config(text="二维码刷新中...", foreground="#a60")
@@ -379,7 +388,9 @@ class App(tk.Tk):
         ttk.Button(bf, text="关闭", command=win.destroy).pack(side="left", padx=6)
 
         shot = session.SESSION_DIR / ("%s_qr_live.png" % key)
-        if not (_load_img(str(shot))):
+        if _load_img(str(shot)):
+            state["qr_ok"] = True
+        else:
             lbl_tip.config(text="二维码加载中，稍后自动出现...", foreground="#a60")
         win.after(2000, _poll)
 
@@ -426,6 +437,16 @@ class App(tk.Tk):
                   foreground="#888", wraplength=560).grid(row=2, column=0, columnspan=5, padx=8, sticky="w")
         ttk.Label(f, text="登录方式：先到「③ 平台登录」页签扫码登录，检索/投递会自动复用该登录态。",
                   foreground="#0a6", wraplength=560).grid(row=3, column=0, columnspan=5, padx=8, sticky="w")
+        try:
+            _lo, _hi = config.search_scroll_bounds()
+            _interval_text = "滚动间隔 %s–%s 秒随机（每次滚动前重新取值）" % (_lo, _hi)
+        except ValueError as exc:
+            _interval_text = "滚动间隔配置错误：%s" % exc
+        ttk.Label(f, text=_interval_text, foreground="#888", wraplength=560).grid(
+            row=4, column=0, columnspan=5, padx=8, sticky="w")
+        self.btn_resume = ttk.Button(f, text="验证后继续检索", command=self._search_resume,
+                                     state="disabled")
+        self.btn_resume.grid(row=4, column=5, padx=8, sticky="w")
 
     def _search(self):
         if not self.user:
@@ -436,19 +457,42 @@ class App(tk.Tk):
             messagebox.showwarning("抓取", "关键词不能为空"); return
         pages = int(self.spn_pages.get())
         city = self.ent_city.get().strip()
+        self._last_search_params = (key, kw, city, pages)
+        self._run_search(key, kw, city, pages)
+
+    def _search_resume(self):
+        """人工完成安全验证后，用上次的检索参数再跑一轮（只重跑一次，不自动循环）。"""
+        params = getattr(self, "_last_search_params", None)
+        if not params:
+            messagebox.showinfo("继续检索", "还没有可继续的检索任务"); return
+        key, kw, city, pages = params
+        log("继续检索 %s：%s（%d 页）..." % (key, kw, pages))
+        self._run_search(key, kw, city, pages)
+
+    def _run_search(self, key, kw, city, pages):
+        import session
         uid = resume_store.ensure_user_id(self.user)
         log("开始检索 %s：%s（%d 页）..." % (key, kw, pages))
+        self.btn_resume.config(state="disabled")
 
         def work():
             import loop
-            jobs, logs = loop.search_logged_in_platforms([key], kw, city=city, pages=pages)
-            for _, m in logs:
-                log("[%s] %s" % (key, m))
+            # 实时诊断直接进日志队列；失败原因由诊断行给出，不再重复打印返回值里的 logs
+            jobs, _logs = loop.search_logged_in_platforms(
+                [key], kw, city=city, pages=pages, on_event=log)
             if jobs:
                 n = jobstore.store_jobs(jobs, user_id=uid)
                 log("入库完成：%d 条" % n)
-            else:
-                log("未检索到岗位")
+            diag = session.last_search_diagnostic(key)
+            if diag.get("kind") in ("blocked_verification", "rate_limited"):
+                def unlock():
+                    self.btn_resume.config(state="normal")
+                    log("完成浏览器中的验证后，点「验证后继续检索」可接着抓。")
+                try:
+                    self.after(0, unlock)
+                except Exception:
+                    pass
+
         self._run(work)
 
     # ---------- ⑤ 投递 ----------

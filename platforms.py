@@ -435,3 +435,24 @@ for _key, _cfg in DELIVERY.items():
     if _key in PLATFORMS:
         PLATFORMS[_key].update(_cfg)
 
+# ---------- 检索安全验证 / 限流的识别规则（纯数据，供 session.dpage_search 使用）----------
+# 判定顺序与证据强度：路径段 > 标题提示 > 无岗位卡片的可见文本提示；弱线索只记录不判定。
+# 1) 只认独立路径段，不做整串 URL 子串匹配（否则 query=security 会被误报）。
+SEARCH_SECURITY_PATH_SEGMENTS = ("security", "security-check")
+# 2) 强提示词：命中即为可疑验证页
+SEARCH_SECURITY_STRONG_HINTS = ("安全验证", "访问验证", "滑动验证", "滑块验证",
+                                "security verification")
+# 3) 频控提示：明确的频率限制表达
+SEARCH_RATE_LIMIT_HINTS = ("操作过于频繁", "请求过于频繁", "访问过于频繁", "请稍后再试")
+# 4) 弱线索：只写进诊断，不作为判定依据
+SEARCH_WEAK_HINTS = ("请稍候", "正在加载", "正在验证")
+# 5) URL 脱敏时允许显示取值的查询参数，其余参数值一律遮蔽
+SEARCH_URL_KEEP_QUERY_PARAMS = ("query", "keyword", "keywords", "city", "page")
+# 6) 各平台接口成功码；未登记的平台按 0 处理
+SEARCH_API_SUCCESS_CODES = {"boss": 0, "mock": 0, "lagou": 0, "job51": 0}
+
+
+def search_api_success_code(platform_key):
+    """接口成功码（缺省 0）。判定“有包即成功”或“空列表”都不得绕过它。"""
+    return SEARCH_API_SUCCESS_CODES.get(platform_key, 0)
+

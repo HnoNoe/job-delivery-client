@@ -5,3 +5,6 @@ data/
 build/
 dist/
 secrets_local.py
+sessions/
+logs/
+resumes/
